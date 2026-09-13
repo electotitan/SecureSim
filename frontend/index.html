@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Signal Path — Secure Communication Pipeline Simulator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="grain"></div>
+
+<header class="hero">
+  <div class="hero-inner">
+    <p class="hero-kicker">Interactive Mathematical Simulator</p>
+    <h1 class="hero-title">Signal <span class="hero-title-dim">Path</span></h1>
+    <p class="hero-sub">Every transformation a message undergoes between sender and receiver — Huffman coding,
+      AES &amp; RSA, Reed&#8211;Solomon, Dijkstra routing — built from first principles and watched bit by bit.</p>
+  </div>
+</header>
+
+<main class="app">
+
+  <!-- ===================== CONTROLS ===================== -->
+  <section class="panel controls" aria-label="Pipeline controls">
+    <div class="control-row">
+      <label class="field field-grow">
+        <span class="field-label">Message</span>
+        <input id="messageInput" class="field-input" type="text" maxlength="500"
+               value="Meet at the north gate at 0600. Bring the manifest." />
+      </label>
+    </div>
+
+    <div class="control-row control-row-wrap">
+      <label class="field">
+        <span class="field-label">Error correction</span>
+        <select id="eccSelect" class="field-input">
+          <option value="hamming">Hamming(7,4) — single-bit</option>
+          <option value="reed-solomon">Reed&#8211;Solomon — burst</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span class="field-label">Channel model</span>
+        <select id="channelSelect" class="field-input">
+          <option value="bsc">Binary symmetric</option>
+          <option value="awgn">AWGN (Gaussian)</option>
+        </select>
+      </label>
+
+      <label class="field field-grow">
+        <span class="field-label">Noise level <output id="noiseValue">0.02</output></span>
+        <input id="noiseSlider" class="field-slider" type="range" min="0" max="0.3" step="0.005" value="0.02" />
+      </label>
+
+      <label class="field">
+        <span class="field-label">Route</span>
+        <span class="route-inline">
+          <select id="routeSource" class="field-input field-narrow"></select>
+          <span class="route-arrow">&#8594;</span>
+          <select id="routeTarget" class="field-input field-narrow"></select>
+        </span>
+      </label>
+    </div>
+
+    <div class="control-row control-row-actions">
+      <button id="runBtn" class="btn btn-primary">Run full pipeline</button>
+      <div class="step-controls" id="stepControls" hidden>
+        <button id="prevBtn" class="btn btn-ghost" aria-label="Previous stage">&#8592; Prev</button>
+        <span id="stepIndicator" class="step-indicator">Stage 1 / 11</span>
+        <button id="nextBtn" class="btn btn-ghost" aria-label="Next stage">Next &#8594;</button>
+      </div>
+      <span id="runStatus" class="run-status" aria-live="polite"></span>
+    </div>
+  </section>
+
+  <!-- ===================== SIGNAL PATH NAV ===================== -->
+  <nav class="signal-path" id="signalPath" aria-label="Pipeline stages">
+    <!-- populated by app.js -->
+  </nav>
+
+  <!-- ===================== RESULT BANNER ===================== -->
+  <section id="resultBanner" class="result-banner" hidden></section>
+
+  <!-- ===================== STAGE DETAIL ===================== -->
+  <section class="panel stage-detail" id="stageDetail" aria-label="Stage detail">
+    <div class="empty-state">
+      <p>No transmission yet.</p>
+      <p class="empty-state-sub">Set a message and press <strong>Run full pipeline</strong> to send it through
+        all eleven stages, or explore a stage on its own below.</p>
+    </div>
+  </section>
+
+  <!-- ===================== EXPLORE (standalone stage playgrounds) ===================== -->
+  <section class="panel explore" aria-label="Explore individual stages">
+    <h2 class="section-title">Explore a stage in isolation</h2>
+    <p class="section-sub">These call each stage's own endpoint directly, outside of a full transmission.</p>
+
+    <div class="explore-grid">
+
+      <div class="explore-card">
+        <h3>Huffman tree</h3>
+        <input id="huffmanText" class="field-input" type="text" value="mississippi river" />
+        <button class="btn btn-small" id="huffmanBtn">Build tree</button>
+        <div id="huffmanTreeSvg" class="explore-output tree-output"></div>
+        <div id="huffmanStats" class="mono-stats"></div>
+      </div>
+
+      <div class="explore-card">
+        <h3>Network topology &amp; shortest path</h3>
+        <p class="explore-hint">Add or remove edges, then find the shortest path.</p>
+        <div id="graphSvg" class="explore-output graph-output"></div>
+        <div class="edge-editor">
+          <input id="edgeFrom" class="field-input field-narrow" placeholder="from" />
+          <input id="edgeTo" class="field-input field-narrow" placeholder="to" />
+          <input id="edgeWeight" class="field-input field-narrow" placeholder="weight" type="number" min="0" />
+          <button class="btn btn-small" id="addEdgeBtn">Add edge</button>
+          <button class="btn btn-small btn-ghost" id="resetTopologyBtn">Reset</button>
+        </div>
+      </div>
+
+      <div class="explore-card">
+        <h3>Noisy channel</h3>
+        <input id="channelBits" class="field-input" type="text" value="1011001101011010" />
+        <label class="field">
+          <span class="field-label">Flip probability <output id="explFlipValue">0.15</output></span>
+          <input id="explFlipSlider" class="field-slider" type="range" min="0" max="1" step="0.01" value="0.15" />
+        </label>
+        <button class="btn btn-small" id="channelBtn">Transmit</button>
+        <div id="channelOutput" class="explore-output"></div>
+      </div>
+
+      <div class="explore-card">
+        <h3>AES-128 round trace</h3>
+        <input id="aesPlaintext" class="field-input" type="text" placeholder="16 bytes, hex" value="00112233445566778899aabbccddeeff" />
+        <button class="btn btn-small" id="aesBtn">Encrypt one block</button>
+        <div id="aesOutput" class="explore-output"></div>
+      </div>
+
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <p>Every algorithm on this page — Huffman, LZ77, AES, RSA, CRC&#8211;32, Dijkstra, Hamming(7,4), Reed&#8211;Solomon —
+    is implemented from first principles in Python. No cryptography, compression, or coding-theory library does the
+    math for it.</p>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
