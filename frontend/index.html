@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Secure Communication Simulator</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Skip to workspace</a>
+
+  <header class="topbar">
+    <h1 class="title">Secure Digital Communication Simulator</h1>
+    <div class="topbar-actions">
+      <div id="backend-status" class="status status-pending" role="status" aria-live="polite">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="backend-status-text">Checking backend…</span>
+      </div>
+      <button id="retry-btn" class="btn" type="button" hidden>Retry connection</button>
+      <a class="btn btn-link" href="/docs" target="_blank" rel="noopener">API docs</a>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidebar" aria-label="Communication stages">
+      <h2 class="sidebar-title">Pipeline stages</h2>
+      <ol id="stage-list" class="stage-list"></ol>
+    </nav>
+
+    <main id="workspace" class="workspace" tabindex="-1">
+      <section class="panel">
+        <h2>Checkpoint 1: application scaffold</h2>
+        <p>
+          The server and frontend are running. No mathematical stage is implemented yet,
+          so every stage in the sidebar is marked <strong>Not started</strong>.
+        </p>
+        <dl class="facts">
+          <dt>Backend version</dt>
+          <dd id="fact-version">unknown</dd>
+          <dt>Health endpoint</dt>
+          <dd><code>GET /api/health</code></dd>
+        </dl>
+      </section>
+
+      <section class="panel">
+        <h2>Planned transformation chain</h2>
+        <p class="muted">
+          Each stage will be added and verified one at a time. Representations at stage
+          boundaries are fixed in the spec, so no stage consumes data it cannot invert.
+        </p>
+        <p class="chain">
+          Unicode text → UTF-8 bytes → LZ77 tokens → AES-CBC ciphertext → packets (+CRC-32)
+          → route → channel → error correction → reassembly → AES decrypt → LZ77 decompress
+          → UTF-8 text → byte-for-byte comparison
+        </p>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
