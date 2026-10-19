@@ -6,4 +6,4 @@ pytest>=8.0
 # newer Starlette prefers httpx2 and warns that httpx is deprecated. Both are listed so every
 # supported Starlette version works; having both installed is harmless (verified).
 httpx>=0.27
-httpx2>=2.0
+httpx2>=2.12.0
