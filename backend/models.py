@@ -8,10 +8,16 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+
+from backend.pipeline.compression import (
+    DEFAULT_LOOKAHEAD_SIZE, DEFAULT_WINDOW_SIZE, MAX_LOOKAHEAD_SIZE, MAX_WINDOW_SIZE,
+)
 
 MAX_TEXT_CHARS = 10_000          # characters accepted by the text-based endpoints
 MAX_BODY_BYTES = 1_000_000       # global request-body cap (Content-Length)
+MAX_LZ77_BYTES = 40_000          # bytes accepted by the LZ77 endpoint (= 10,000 chars x 4 UTF-8 bytes)
+MAX_TOKENS_RETURNED = 2_000      # per-token records returned (statistics always cover ALL tokens)
 
 
 class StrictModel(BaseModel):
@@ -106,3 +112,81 @@ class BinaryResponse(BaseModel):
     bytes: list[ByteInfo]
     characters: list[CharacterInfo]
     round_trip_ok: bool
+
+
+# --------------------------------------------------------------------------- Stage 3: LZ77
+class LZ77Request(StrictModel):
+    """Exactly one of ``text`` (UTF-8 encoded) or ``data_hex`` (raw bytes as hex) is required."""
+    text: Optional[str] = Field(None, max_length=MAX_TEXT_CHARS)
+    data_hex: Optional[str] = Field(None, max_length=2 * MAX_LZ77_BYTES,
+                                    description="Raw bytes as an even-length hex string.")
+    window_size: StrictInt = Field(DEFAULT_WINDOW_SIZE, ge=1, le=MAX_WINDOW_SIZE)
+    lookahead_size: StrictInt = Field(DEFAULT_LOOKAHEAD_SIZE, ge=1, le=MAX_LOOKAHEAD_SIZE)
+
+    @field_validator("text")
+    @classmethod
+    def _text_is_utf8_encodable(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            try:
+                v.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError("text contains characters that cannot be encoded as UTF-8")
+        return v
+
+    @field_validator("data_hex")
+    @classmethod
+    def _hex_is_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            if len(v) % 2:
+                raise ValueError("data_hex must have an even number of hex digits")
+            if set(v) - set("0123456789abcdefABCDEF"):
+                raise ValueError("data_hex may contain only the characters 0-9, a-f, A-F")
+        return v
+
+    @model_validator(mode="after")
+    def _exactly_one_input(self) -> "LZ77Request":
+        if (self.text is None) == (self.data_hex is None):
+            raise ValueError("provide exactly one of 'text' or 'data_hex'")
+        return self
+
+
+class LZ77TokenInfo(BaseModel):
+    index: int
+    position: int
+    kind: str = Field(description="literal | match | match-end (end-of-input token, empty next byte)")
+    offset: int
+    length: int
+    next_hex: str
+    next_char: Optional[str]
+    covers: int
+    match_source_start: Optional[int]
+    match_hex: str
+    overlapping: bool
+    window_start: int
+    lookahead_end: int
+    bits: int
+
+
+class LZ77Response(BaseModel):
+    window_size: int
+    lookahead_size: int
+    original_bytes: int
+    token_count: int
+    literal_count: int
+    match_count: int
+    offset_bits: int
+    length_bits: int
+    payload_bits: int
+    header_bytes: int
+    compressed_bytes: int
+    compression_ratio: Optional[float] = Field(description="original / compressed; null if undefined")
+    space_saved_percent: Optional[float] = Field(
+        description="(1 - compressed/original) * 100; negative means expansion; null for empty input")
+    expanded: bool = Field(description="True when the serialised form is larger than the input")
+    tokens: list[LZ77TokenInfo]
+    tokens_returned: int
+    tokens_truncated: bool
+    round_trip_ok: bool = Field(description="Server decompressed the tokens and compared with the input bytes.")
+    serialization_round_trip_ok: bool = Field(
+        description="serialize -> deserialize reproduced the tokens, and the serialised size matches the statistics.")
+    size_note: str

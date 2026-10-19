@@ -10,6 +10,7 @@ Checkpoint 1 scope: application scaffold only.
 Stage endpoints are added checkpoint by checkpoint:
   * POST /api/encode/huffman  (Checkpoint 3)
   * POST /api/encode/binary   (Checkpoint 3)
+  * POST /api/compress/lz77   (Checkpoint 4)
 """
 from __future__ import annotations
 
@@ -22,12 +23,13 @@ from fastapi.openapi.docs import get_swagger_ui_html
 
 from backend.errors import ValidationFailure, error_body, register_error_handlers
 from backend.models import (
-    MAX_BODY_BYTES, BinaryRequest, BinaryResponse, HuffmanRequest, HuffmanResponse,
+    MAX_BODY_BYTES, MAX_TOKENS_RETURNED, BinaryRequest, BinaryResponse, HuffmanRequest,
+    HuffmanResponse, LZ77Request, LZ77Response,
 )
-from backend.pipeline import binary_repr, source_encoding
+from backend.pipeline import binary_repr, compression, source_encoding
 
 APP_NAME = "Interactive Mathematical Simulator for Secure Digital Communication"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -110,6 +112,38 @@ def encode_binary(req: BinaryRequest) -> BinaryResponse:
     return BinaryResponse(
         bitstring=bits, byte_count=len(grid), character_count=len(req.text),
         bytes=grid, characters=characters, round_trip_ok=round_trip_ok,
+    )
+
+
+@app.post("/api/compress/lz77", response_model=LZ77Response, tags=["stage 3: compression"])
+def compress_lz77(req: LZ77Request) -> LZ77Response:
+    """LZ77-compress text (UTF-8) or raw bytes; sizes come from a concrete serialisation."""
+    w, l = req.window_size, req.lookahead_size
+    try:
+        data = req.text.encode("utf-8") if req.text is not None else bytes.fromhex(req.data_hex)
+        tokens = compression.lz77_compress(data, w, l)
+        stats = compression.compression_stats(len(data), tokens, w, l)
+        described = compression.describe_tokens(data, tokens, w, l, limit=MAX_TOKENS_RETURNED)
+        # Verify by actually reversing the transformation (never assume success).
+        round_trip_ok = compression.lz77_decompress(tokens, window_size=w, lookahead_size=l) == data
+    except ValueError as exc:
+        raise ValidationFailure(str(exc)) from exc
+    # Self-check of the size statistics. A failure here is a server-side inconsistency, not a
+    # user error, so it is reported as a flag instead of being turned into a validation error.
+    try:
+        blob = compression.serialize_tokens(tokens, w, l)
+        serialization_ok = (compression.deserialize_tokens(blob, w, l) == tokens
+                            and len(blob) == stats["compressed_bytes"])
+    except ValueError:
+        serialization_ok = False
+    return LZ77Response(
+        window_size=w, lookahead_size=l, **stats, tokens=described,
+        tokens_returned=len(described), tokens_truncated=len(described) < len(tokens),
+        round_trip_ok=round_trip_ok, serialization_round_trip_ok=serialization_ok,
+        size_note=("compressed_bytes is the size of the fixed-width serialisation (1 header byte + "
+                   "packed tokens), not the token count; each token costs offset_bits + length_bits "
+                   "+ 1 + 8 bits (the last 8 only if a next byte is present), so data without "
+                   "repeats can expand."),
     )
 
 

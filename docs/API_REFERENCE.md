@@ -30,7 +30,7 @@ Tracebacks and the submitted input values are never included in error responses.
 
 ## GET `/api/health`
 
-`{"status": "ok", "app": "...", "version": "0.3.0"}`
+`{"status": "ok", "app": "...", "version": "0.4.0"}`
 
 ## POST `/api/encode/huffman`
 
@@ -74,3 +74,46 @@ Response (abridged): `bitstring` (`010010001100001110101001`), `byte_count`, `ch
 `round_trip_ok`.
 
 `role` is one of `ascii`, `lead-2`, `lead-3`, `lead-4`, `continuation`, `invalid`.
+
+
+## POST `/api/compress/lz77`
+
+Request: exactly **one** of `text` (UTF-8 encoded, at most 10,000 characters) or `data_hex` (raw bytes as an even-length
+hex string, at most 40,000 bytes; digits `0-9a-fA-F` only, no prefix or whitespace). Optional integers
+`window_size` (1..32768, default 4096) and `lookahead_size` (1..255, default 18); booleans, floats and numeric strings
+are rejected.
+
+```json
+{"text": "abracadabra", "window_size": 4096, "lookahead_size": 18}
+```
+
+Response (values from a real run):
+
+```json
+{
+  "window_size": 4096, "lookahead_size": 18,
+  "original_bytes": 11, "token_count": 6, "literal_count": 3, "match_count": 3,
+  "offset_bits": 13, "length_bits": 5, "payload_bits": 154, "header_bytes": 1,
+  "compressed_bytes": 21, "compression_ratio": 0.5238095238095238,
+  "space_saved_percent": -90.9090909090909, "expanded": true,
+  "tokens": [ {"index": 5, "position": 7, "kind": "match-end", "offset": 7, "length": 4,
+               "next_hex": "", "next_char": null, "covers": 4, "match_source_start": 0,
+               "match_hex": "61627261", "overlapping": false, "window_start": 0,
+               "lookahead_end": 11, "bits": 19}, "..." ],
+  "tokens_returned": 6, "tokens_truncated": false,
+  "round_trip_ok": true, "serialization_round_trip_ok": true,
+  "size_note": "compressed_bytes is the size of the fixed-width serialisation ..."
+}
+```
+
+Notes:
+* Tokens are `(offset, length, next_byte)`; `kind` is `literal`, `match`, or `match-end` (end-of-input token with an empty
+  `next_hex`). Offsets count backward from the token's `position`.
+* All statistics cover **every** token; at most 2,000 per-token records are returned (`tokens_truncated` tells you).
+* `compression_ratio` and `space_saved_percent` are `null` for empty input. `expanded: true` means the serialised form is
+  larger than the input (common for short or non-repeating data).
+* `round_trip_ok`: the server decompressed the tokens and compared them with the input bytes.
+  `serialization_round_trip_ok`: serialize then deserialize reproduced the tokens and the size matches the statistics.
+  Both are computed on every request, never assumed.
+* Errors use the standard format; invalid fields are named in `details[].field` (for example `body.window_size`, or `body`
+  for the "exactly one of text/data_hex" rule).

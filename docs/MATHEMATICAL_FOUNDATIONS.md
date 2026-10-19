@@ -1,6 +1,6 @@
 # Mathematical Foundations
 
-> Grows stage by stage. Current sections: GF(2^8) and the AES S-box (Checkpoint 2); Huffman coding and binary representation (Checkpoint 3).
+> Grows stage by stage. Current sections: GF(2^8) and the AES S-box (Checkpoint 2); Huffman coding and binary representation (Checkpoint 3); LZ77 compression (Checkpoint 4).
 
 ## 1. The finite field GF(2^8)
 
@@ -132,3 +132,72 @@ cannot be encoded at all.
 
 An arbitrary byte stream (for example ciphertext later in the pipeline) is *not* generally valid UTF-8, which is why
 the pipeline never applies text decoding to anything except the final, verified plaintext.
+
+
+---
+
+## 6. Compression: LZ77 (Stage 3)
+
+**Idea.** Real data repeats itself. LZ77 (Ziv and Lempel, 1977) replaces a repeated substring by a *back-reference*
+into a sliding **search window** of data already processed. A **lookahead buffer** holds the bytes still to be coded.
+
+**Token convention** (`(offset, length, next_byte)`):
+
+| field       | meaning |
+|-------------|---------|
+| `offset`    | distance backward from the current output position; `1 <= offset <= min(window, position)` for a match, `0` for a literal |
+| `length`    | number of bytes copied from `output[position - offset :]` (0 for a literal) |
+| `next_byte` | the literal byte after the match, as `bytes` of length 1; `b""` only in the **end-of-input token** (a match that reaches the last byte), so no artificial padding is ever needed |
+
+A token covers `length + len(next_byte)` bytes, and the encoder keeps that at most `lookahead_size`. So a match followed
+by a literal has `length <= lookahead_size - 1`, while an end-of-input match may use the whole lookahead.
+
+**Overlapping matches.** If `offset < length`, the source region runs into bytes the same token is producing.
+Example `aaaa`: literal `(0,0,'a')`, then `(1,3,b"")`: copy 1 byte back, 3 times; each copied byte is the one just written.
+Decompression therefore copies **one byte at a time**. When `offset == length` the source ends exactly where the output
+begins, which is *not* an overlap.
+
+**Search policy** (deterministic): longest match whose start lies in the window; among equal lengths, the **smallest
+offset**. This is a greedy parse: it is simple and fast but not guaranteed to give the smallest possible token list
+overall (an optimal parse would need dynamic programming).
+
+Why matches can be binary-searched: if a match of length `L` exists at some offset, one of length `L - 1` exists at the
+same offset, so existence is monotone in `L`. The fast engine uses this; a readable brute-force engine implements the same
+rule, and the tests require identical token output on 400 random cases plus larger inputs.
+
+**Serialised size (token count is not a size).** Sizes are measured on a concrete fixed-width format:
+`offset_bits = W.bit_length()`, `length_bits = L.bit_length()`, a 1-bit "next present" flag, 8 bits if present, packed
+into bytes, plus 1 header byte holding the number of padding bits. `W` and `L` are agreed out of band. Defaults
+`W = 4096, L = 18` give 13 + 5 + 1 + 8 = **27 bits for a literal that represents one byte**.
+
+    compression ratio  R = original size / compressed size          (R < 1 means expansion)
+    space saved           = (1 - compressed / original) * 100 %     (negative means expansion)
+
+Consequences, all verified by tests:
+* Short or non-repeating input **expands**: `aaaa` (4 bytes) becomes 7 bytes (R = 0.571, -75 %).
+* Two token lists with the same length can have different byte sizes (end-of-input tokens carry no byte).
+* Empty input has no tokens, serialises to `b""`, and R is undefined (`null`).
+
+**Complexity.** Reference engine: O(n * W * L) worst case. Fast engine: O(n * log L) substring searches over a window of
+at most W bytes, with a small constant because the search runs in C. Both are implementation-dependent, not universal bounds.
+
+**Theory versus this implementation.** Sliding-window LZ77 with an unbounded window is asymptotically optimal for
+stationary ergodic sources. This implementation uses a 4 KiB window and fixed-width tokens, so it does *not* achieve
+that and is frequently worse than entropy coding on short or noisy data.
+
+### Observed comparison (single seeded run; observations, not general laws)
+
+Measured with the running code (`random.Random(1)`, defaults `W = 4096, L = 18`; Huffman figures are the payload only,
+code-table cost not included):
+
+| input (n chars)                         | H (bits/char) | Huffman payload | LZ77 compressed | LZ77 ratio |
+|-----------------------------------------|--------------:|----------------:|----------------:|-----------:|
+| iid, P(a) = 0.9, P(b) = 0.1 (2000)      | 0.466         | 250.0 B (1.000 b/char) | 419 B    | 4.77 |
+| iid uniform over {a, b} (2000)          | 1.000         | 250.0 B         | 649 B           | 3.08 |
+| `abc` repeated (2001)                   | 1.585         | 416.9 B         | 385 B           | 5.20 |
+| repeated English sentence (2025)        | 4.397         | 1130.6 B        | 480 B           | 4.22 |
+| iid uniform lowercase letters (2000)    | 4.689         | 1181.5 B        | 2538 B          | **0.79 (expands)** |
+
+What this illustrates: a *low-entropy* source (first row, H = 0.466) is not automatically compressed well by every method.
+Huffman codes whole symbols, so it cannot go below 1 bit/char even though the entropy is 0.466. LZ77 reaches about 1.68
+bits/char here, and neither approaches the entropy bound. On structureless data (last row) LZ77 expands it.
