@@ -201,3 +201,19 @@ def generate_sbox() -> list[int]:
 def sbox_table() -> tuple[int, ...]:
     """Cached immutable S-box (computed once by ``generate_sbox``; never hardcoded)."""
     return tuple(generate_sbox())
+
+
+@lru_cache(maxsize=None)
+def mul_table(c: int) -> tuple[int, ...]:
+    """Table of x -> c * x in GF(2^8), computed from ``gf_multiply`` (used by MixColumns)."""
+    _check_element(c, "c")
+    return tuple(gf_multiply(c, x) for x in range(FIELD_ORDER))
+
+
+@lru_cache(maxsize=1)
+def inverse_sbox_table() -> tuple[int, ...]:
+    """Inverse S-box: the inverse permutation of the DERIVED S-box (never hardcoded)."""
+    inverse = [0] * FIELD_ORDER
+    for x, y in enumerate(sbox_table()):
+        inverse[y] = x
+    return tuple(inverse)
