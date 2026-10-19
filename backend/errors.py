@@ -43,6 +43,19 @@ class ValidationFailure(Exception):
         self.details = details or []
 
 
+class IntegrityFailure(Exception):
+    """Data failed a verification step (bad ciphertext length, bad padding, checksum...).
+
+    The request itself was well-formed, so this is reported as HTTP 422 with
+    ``type == "integrity_failure"`` (distinct from ``validation_error``).
+    """
+
+    def __init__(self, message: str, details: Optional[list[dict[str, Any]]] = None):
+        super().__init__(message)
+        self.message = message
+        self.details = details or []
+
+
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def _request_validation(_: Request, exc: RequestValidationError) -> JSONResponse:
@@ -60,6 +73,11 @@ def register_error_handlers(app: FastAPI) -> None:
     async def _validation_failure(_: Request, exc: ValidationFailure) -> JSONResponse:
         return JSONResponse(status_code=422,
                             content=error_body("validation_error", exc.message, exc.details))
+
+    @app.exception_handler(IntegrityFailure)
+    async def _integrity_failure(_: Request, exc: IntegrityFailure) -> JSONResponse:
+        return JSONResponse(status_code=422,
+                            content=error_body("integrity_failure", exc.message, exc.details))
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_exception(_: Request, exc: StarletteHTTPException) -> JSONResponse:

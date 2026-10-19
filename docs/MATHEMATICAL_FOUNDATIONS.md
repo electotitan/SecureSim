@@ -1,6 +1,6 @@
 # Mathematical Foundations
 
-> Grows stage by stage. Current sections: GF(2^8) and the AES S-box (Checkpoint 2); Huffman coding and binary representation (Checkpoint 3); LZ77 compression (Checkpoint 4).
+> Grows stage by stage. Current sections: GF(2^8) and the AES S-box (Checkpoint 2); Huffman coding and binary representation (Checkpoint 3); LZ77 compression (Checkpoint 4); AES-128 (Checkpoint 5).
 
 ## 1. The finite field GF(2^8)
 
@@ -201,3 +201,88 @@ code-table cost not included):
 What this illustrates: a *low-entropy* source (first row, H = 0.466) is not automatically compressed well by every method.
 Huffman codes whole symbols, so it cannot go below 1 bit/char even though the entropy is 0.466. LZ77 reaches about 1.68
 bits/char here, and neither approaches the entropy bound. On structureless data (last row) LZ77 expands it.
+
+
+---
+
+## 7. AES-128 encryption and decryption (Stages 4B and 11)
+
+> **Educational implementation only.** It is not constant-time, CBC gives no integrity protection, and padding errors
+> are distinguishable (a padding-oracle risk). Never use it to protect real data; use a vetted library and an
+> authenticated mode (for example AES-GCM) in real systems.
+
+**Structure.** AES-128 is a substitution-permutation network on a 16-byte block with a 16-byte key and 10 rounds:
+an initial AddRoundKey, 9 full rounds (SubBytes, ShiftRows, MixColumns, AddRoundKey) and a final round without
+MixColumns. Decryption applies the inverse operations with the round keys in reverse order.
+
+**Byte order (used everywhere, including the visualisations).** A block `b[0..15]` is loaded into the 4x4 state column by
+column: `state[r][c] = b[r + 4c]`, so bytes 0..3 form column 0. Round keys use the same order, and byte `i` of a round key
+is XORed into `state[i mod 4][i div 4]`.
+
+**SubBytes (confusion).** `S(a) = Affine(a^-1)` in GF(2^8) with `0^-1 := 0` (section 3). The S-box is *derived* by the
+code, not stored. Inversion supplies the non-linearity; the affine map hides the algebraic structure. Example from the
+running code: `0x53 -> inverse 0xca -> S = 0xed`.
+
+**ShiftRows (diffusion across columns).** Row `r` is rotated left by `r` positions. The inverse rotates right.
+
+**MixColumns (diffusion within a column).** Each column is multiplied by the circulant matrix over GF(2^8)
+
+    | 2 3 1 1 |
+    | 1 2 3 1 |        (equivalently a(x) = 3x^3 + x^2 + x + 2  modulo x^4 + 1)
+    | 1 1 2 3 |
+    | 3 1 1 2 |
+
+The inverse matrix is `[14 11 13 9; 9 14 11 13; 13 9 14 11; 11 13 9 14]`; the tests verify that the two multiply to the
+identity over GF(2^8) and that `InvMixColumns(MixColumns(x)) = x` on 300 random states. All multiplication tables
+are computed from `gf_multiply`.
+
+**AddRoundKey.** XOR with the round key (addition in GF(2^8)); it is its own inverse.
+
+**Key expansion.** For `i = 4 .. 43`: `w[i] = w[i-4] XOR T(w[i-1])` where for `i` divisible by 4
+`T = SubWord(RotWord(.)) XOR Rcon[i/4]`, otherwise `T` is the identity. `Rcon[j] = x^(j-1)` in GF(2^8)
+(`01 02 04 08 10 20 40 80 1b 36`, computed by repeated multiplication by 2).
+
+### Worked example (FIPS-197 Appendix C.1, produced by the running code)
+
+Key `000102030405060708090a0b0c0d0e0f`, plaintext `00112233445566778899aabbccddeeff`, ciphertext
+`69c4e0d86a7b0430d8cdb78070b4c55a`. State bytes below are in the column-major order described above.
+
+| step (round 1)                     | state |
+|------------------------------------|-------|
+| after initial AddRoundKey          | `00102030405060708090a0b0c0d0e0f0` |
+| SubBytes                           | `63cab7040953d051cd60e0e7ba70e18c` |
+| ShiftRows                          | `6353e08c0960e104cd70b751bacad0e7` |
+| MixColumns                         | `5f72641557f5bc92f7be3b291db9f91a` |
+| round key 1                        | `d6aa74fdd2af72fadaa678f1d6ab76fe` |
+| AddRoundKey (start of round 2)     | `89d810e8855ace682d1843d8cb128fe4` |
+
+One MixColumns output byte, worked in GF(2^8) (column 0, row 0): `{02}*{63} xor {03}*{53} xor {01}*{e0} xor {01}*{8c} = c6 xor f5 xor e0 xor 8c = 0x5f`.
+
+### CBC mode and PKCS#7 padding
+
+CBC: `C_0 = IV`, `C_i = E_K(P_i XOR C_(i-1))`; decryption `P_i = D_K(C_i) XOR C_(i-1)`. The IV is not secret but should be
+unpredictable and not reused with the same key. The IV is not prepended to the output by `aes_cbc_encrypt`; the API
+returns it separately.
+
+PKCS#7 **always** appends `n` bytes of value `n` (`1 <= n <= 16`), so a block-aligned message receives a whole extra block
+(otherwise unpadding would be ambiguous). An empty message therefore encrypts to exactly one block. Unpadding rejects: a
+zero or >16 length byte, inconsistent padding bytes, and data that is empty or not a multiple of 16.
+
+Properties demonstrated by the tests:
+* identical plaintext blocks give different ciphertext blocks (unlike ECB);
+* **malleability**: flipping bit `b` of ciphertext block `i` garbles plaintext block `i` and flips exactly bit `b` of block
+  `i+1`, with all other blocks unaffected. CBC detects nothing by itself;
+* a wrong IV damages only the first plaintext block; a wrong key gives garbage or (usually) a padding error, which
+  cannot be relied on as an integrity check.
+
+### Verification evidence
+
+* FIPS-197 Appendix C.1 (the gating vector) and Appendix B block vectors, encrypt and decrypt.
+* FIPS-197 round-1 intermediate states, key-expansion words (Appendix A.1) and the round-1 key.
+* NIST SP 800-38A ECB (F.1.1, first block) and CBC (F.2.1, four blocks) vectors.
+* Known MixColumns columns (`db135345 -> 8e4da1bc`, `f20a225c -> 9fdc589d`, ...).
+* Round trips on 400 random key/block pairs, CBC for many message lengths including 0 and exact multiples of 16.
+* Experimental sanity check (not a security proof): over 200 seeded samples a single flipped plaintext bit changed
+  between 56 and 72 of 128 ciphertext bits on average (the full avalanche experiment is a later checkpoint).
+
+Only AES-128 is implemented. Requests for AES-192/256 receive HTTP 501 (`unsupported_operation`).
