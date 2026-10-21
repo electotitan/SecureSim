@@ -37,18 +37,6 @@ Troubleshooting: if collection stops with *"starlette.testclient requires the ht
 `httpx` nor `httpx2` installed. It is an environment problem, not a code problem: activate the project's
 venv and run `pip install -r requirements.txt`. (Reproduced and fixed during Checkpoint 5.)
 
-### If pytest crashes before running any test (ROS / other Python tooling in your shell)
-
-Symptom: a long traceback ending in a plugin from somewhere else, for example
-`/opt/ros/humble/.../launch_testing/...` and `ModuleNotFoundError: No module named 'lark'`. Cause: your shell exports a
-`PYTHONPATH` (ROS's `setup.bash` does), so pytest auto-loads *that* tooling's pytest plugins even inside this project's
-virtual environment. None of this project's code is involved. Any ONE of these fixes it:
-
-    ./run_tests.sh                                   # recommended: ignores PYTHONPATH and third-party plugin autoload
-    env -u PYTHONPATH python -m pytest               # drop the foreign PYTHONPATH for this one command
-    PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest   # keep PYTHONPATH, stop plugin auto-discovery
-
-Or open a terminal in which that tooling has not been sourced. (Reproduced and verified during Checkpoint 6.)
 
 ## Quick start
 
