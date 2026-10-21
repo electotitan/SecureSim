@@ -13,6 +13,7 @@ Stage endpoints are added checkpoint by checkpoint:
   * POST /api/compress/lz77   (Checkpoint 4)
   * POST /api/encrypt/aes     (Checkpoint 5)
   * POST /api/decrypt/aes     (Checkpoint 5)
+  * POST /api/encrypt/rsa-keyexchange (Checkpoint 6)
 """
 from __future__ import annotations
 
@@ -27,16 +28,19 @@ from fastapi.openapi.docs import get_swagger_ui_html
 
 from backend.errors import IntegrityFailure, ValidationFailure, error_body, register_error_handlers
 from backend.models import (
-    MAX_AES_BLOCKS_RETURNED, MAX_BODY_BYTES, MAX_TOKENS_RETURNED, AESDecryptRequest,
-    AESDecryptResponse, AESEncryptRequest, AESEncryptResponse, BinaryRequest, BinaryResponse,
-    HuffmanRequest, HuffmanResponse, LZ77Request, LZ77Response,
+    DEFAULT_RSA_INTEGER_BITS, DEFAULT_RSA_WRAP_BITS, MAX_AES_BLOCKS_RETURNED, MAX_BODY_BYTES,
+    MAX_RSA_PRIME_BITS, MAX_RSA_STEPS_RETURNED, MAX_TOKENS_RETURNED, MIN_RSA_WRAP_BITS,
+    AESDecryptRequest, AESDecryptResponse, AESEncryptRequest, AESEncryptResponse, BinaryRequest,
+    BinaryResponse, HuffmanRequest, HuffmanResponse, LZ77Request, LZ77Response,
+    RSAKeyExchangeRequest, RSAKeyExchangeResponse,
 )
 from backend.pipeline import (
-    binary_repr, compression, decryption_aes, encryption_aes, source_encoding,
+    binary_repr, compression, decryption_aes, decryption_rsa, encryption_aes, encryption_rsa,
+    source_encoding,
 )
 
 APP_NAME = "Interactive Mathematical Simulator for Secure Digital Communication"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -259,6 +263,147 @@ def decrypt_aes(req: AESDecryptRequest) -> AESDecryptResponse:
                  "plaintext_hex": r["plaintext"].hex()} for i, r in enumerate(shown)],
         blocks_truncated=len(shown) < len(records),
         trace=trace, trace_block=req.trace_block if trace is not None else None, warning=AES_WARNING,
+    )
+
+
+RSA_TEXTBOOK_NOTES = [
+    "Textbook RSA has no padding (no OAEP): encryption is deterministic, so equal messages give equal ciphertexts.",
+    "It is malleable: E(a) * E(b) mod n = E(a*b mod n), so ciphertexts can be altered meaningfully without the key.",
+    "The messages 0, 1 and n-1 encrypt to themselves; raw RSA only accepts integers smaller than the modulus.",
+    "These moduli are tiny and can be factored almost instantly; real RSA needs at least 2048 bits and a vetted library.",
+    "A 128-bit AES key as an integer is below 2^128, so the modulus must exceed 2^128 to carry it (at least 129 bits).",
+]
+_RSA_FIELD_MAP = {"bits": "modulus_bits"}
+
+
+def _s(value) -> str:
+    """Big integers cross the JSON boundary as decimal strings (JavaScript numbers are exact only to 2^53)."""
+    return str(value)
+
+
+def _rsa_trace_json(trace: dict) -> dict:
+    steps = trace["steps"]
+    shown = steps[:MAX_RSA_STEPS_RETURNED]
+    return {
+        "base": _s(trace["base"]), "exponent": _s(trace["exponent"]), "modulus": _s(trace["modulus"]),
+        "exponent_bits": trace["exponent_bits"], "initial": _s(trace["initial"]),
+        "squarings": trace["squarings"], "multiplications": trace["multiplications"],
+        "steps": [{"index": st["index"], "bit": st["bit"], "before": _s(st["before"]),
+                   "after_square": _s(st["after_square"]), "multiplied": st["multiplied"],
+                   "after_multiply": _s(st["after_multiply"])} for st in shown],
+        "steps_total": len(steps), "steps_returned": len(shown), "steps_truncated": len(shown) < len(steps),
+        "result": _s(trace["result"]),
+    }
+
+
+def _primality_json(n: int) -> dict:
+    rep = encryption_rsa.primality_report(n)
+    return {"is_prime": rep["is_prime"], "method": rep["method"], "bases": rep["bases"],
+            "random_bases": rep["random_bases"], "error_bound": rep["error_bound"], "witness": rep["witness"]}
+
+
+@app.post("/api/encrypt/rsa-keyexchange", response_model=RSAKeyExchangeResponse, tags=["stage 5: RSA"])
+def rsa_key_exchange(req: RSAKeyExchangeRequest) -> RSAKeyExchangeResponse:
+    """INSECURE educational RSA: key generation, key transport (or a small integer) and decryption, with all arithmetic."""
+    wrap = req.mode == "aes_key_wrap"
+    seeded = req.seed is not None
+    rng = random.Random(req.seed) if seeded else secrets.SystemRandom()
+    e_in = int(req.e) if req.e is not None else None
+    try:
+        if req.p is not None:
+            p_in, q_in = int(req.p), int(req.q)
+            for name, value in (("p", p_in), ("q", q_in)):
+                if value.bit_length() > MAX_RSA_PRIME_BITS:
+                    raise encryption_rsa.RSAKeyError(f"{name} is too large (at most {MAX_RSA_PRIME_BITS} bits)", name)
+            pair, key_source = encryption_rsa.keypair_from_primes(p_in, q_in, e_in), "user_primes"
+        else:
+            bits = req.modulus_bits or (DEFAULT_RSA_WRAP_BITS if wrap else DEFAULT_RSA_INTEGER_BITS)
+            if wrap and bits < MIN_RSA_WRAP_BITS:
+                raise encryption_rsa.RSAKeyError(
+                    f"modulus_bits must be at least {MIN_RSA_WRAP_BITS} to carry a 128-bit AES key "
+                    f"(n must exceed 2^128)", "bits")
+            pair, key_source = encryption_rsa.generate_keypair(bits, e_in, rng), "generated"
+    except encryption_rsa.RSAKeyError as exc:
+        field = _RSA_FIELD_MAP.get(exc.field, exc.field)
+        raise ValidationFailure(str(exc), [{"field": f"body.{field}", "message": str(exc),
+                                            "code": "invalid_key_parameter"}] if field else []) from exc
+
+    pub, priv, n = pair.public, pair.private, pair.public.n
+    key_bytes = None
+    key_supplied = wrap and req.aes_key_hex is not None
+    if wrap:
+        key_bytes = bytes.fromhex(req.aes_key_hex) if key_supplied else rng.randbytes(16)
+        m = encryption_rsa.key_to_int(key_bytes)
+        if m >= n:
+            where = "p" if req.p is not None else "modulus_bits"
+            raise ValidationFailure(
+                f"the AES key ({m.bit_length()} bits as an integer) does not fit below the modulus "
+                f"({n.bit_length()} bits): raw RSA cannot carry it; use a larger modulus",
+                [{"field": f"body.{where}", "message": "modulus too small for a 128-bit key", "code": "modulus_too_small"}])
+        ciphertext = encryption_rsa.rsa_wrap_key(key_bytes, pub)
+    else:
+        if req.message is not None:
+            m = int(req.message)
+            if m >= n:
+                raise ValidationFailure(
+                    f"message must be smaller than the modulus n ({n.bit_length()} bits)",
+                    [{"field": "body.message", "message": "message >= n", "code": "message_too_large"}])
+        else:
+            m = rng.randrange(2, n - 1)
+        ciphertext = encryption_rsa.rsa_encrypt(m, pub)
+
+    etrace = encryption_rsa.rsa_encrypt_trace(m, pub)
+    dtrace = decryption_rsa.rsa_decrypt_trace(ciphertext, priv)
+    recovered = decryption_rsa.rsa_decrypt(ciphertext, priv)
+    key_recovered_ok, recovered_key = None, None
+    if wrap:
+        try:
+            recovered_key = decryption_rsa.rsa_unwrap_key(ciphertext, priv, 16)
+            key_recovered_ok = recovered_key == key_bytes
+        except ValueError:
+            key_recovered_ok = False
+
+    p, q, phi, e, d = pair.p, pair.q, pair.phi, pub.e, priv.d
+    checks = {
+        "p_is_prime": encryption_rsa.is_prime(p), "q_is_prime": encryption_rsa.is_prime(q),
+        "p_differs_from_q": p != q, "n_equals_p_times_q": n == p * q,
+        "phi_equals_p1_times_q1": phi == (p - 1) * (q - 1), "e_less_than_phi": e < phi,
+        "gcd_e_phi": _s(encryption_rsa.extended_gcd(e, phi)[0]), "e_times_d_mod_phi": _s(e * d % phi),
+    }
+    checks["all_ok"] = all(v for k, v in checks.items() if isinstance(v, bool)) and checks["gcd_e_phi"] == "1" \
+        and checks["e_times_d_mod_phi"] == "1"
+    shown_steps = pair.d_steps[:MAX_RSA_STEPS_RETURNED]
+    d_derivation = {
+        "method": "extended Euclid on (e mod phi, phi): d = x mod phi where e*x + phi*y = 1",
+        "equation": f"e * d = 1 (mod phi):  {e} * {d} mod {phi} = {e * d % phi}",
+        "steps": [{"quotient": _s(st["quotient"]), "remainder": _s(st["remainder"]), "x": _s(st["x"]), "y": _s(st["y"])}
+                  for st in shown_steps],
+        "steps_total": len(pair.d_steps), "steps_returned": len(shown_steps),
+        "steps_truncated": len(shown_steps) < len(pair.d_steps),
+    }
+    round_trip_ok = recovered == m and dtrace["result"] == recovered
+    expose_message = (not wrap) or (not key_supplied)
+    return RSAKeyExchangeResponse(
+        mode=req.mode, insecure=True, security_note=encryption_rsa.INSECURE_NOTE,
+        real_world_minimum_modulus_bits=2048, textbook_notes=RSA_TEXTBOOK_NOTES,
+        roles={"receiver": "generates the key pair and publishes the public key (n, e)",
+               "sender": "encrypts the message / AES key with the public key: c = m^e mod n",
+               "receiver_decrypts": "recovers m = c^d mod n with the private exponent d"},
+        key_source=key_source, seeded=seeded, modulus_bits=n.bit_length(),
+        p=_s(p), q=_s(q), n=_s(n), phi=_s(phi), e=_s(e), d=_s(d), e_source=pair.e_source,
+        key_checks=checks, primality={"p": _primality_json(p), "q": _primality_json(q)},
+        d_derivation=d_derivation,
+        message_kind="aes_key_128" if wrap else "integer",
+        message=_s(m) if expose_message else None, message_bits=m.bit_length(),
+        aes_key_hex=key_bytes.hex() if wrap and not key_supplied else None,
+        recovered_key_hex=recovered_key.hex() if wrap and not key_supplied and recovered_key is not None else None,
+        ciphertext=_s(ciphertext), recovered=_s(recovered) if expose_message else None,
+        encryption=_rsa_trace_json(etrace) if req.include_traces else None,
+        decryption=_rsa_trace_json(dtrace) if req.include_traces else None,
+        verification={"round_trip_ok": round_trip_ok, "key_recovered_ok": key_recovered_ok,
+                      "encryption_trace_matches_ciphertext": etrace["result"] == ciphertext,
+                      "key_checks_all_ok": checks["all_ok"]},
+        round_trip_ok=round_trip_ok, key_recovered_ok=key_recovered_ok,
     )
 
 

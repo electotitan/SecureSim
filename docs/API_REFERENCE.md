@@ -30,7 +30,7 @@ Tracebacks and the submitted input values are never included in error responses.
 
 ## GET `/api/health`
 
-`{"status": "ok", "app": "...", "version": "0.5.0"}`
+`{"status": "ok", "app": "...", "version": "0.6.0"}`
 
 ## POST `/api/encode/huffman`
 
@@ -165,3 +165,41 @@ Response (abridged): `plaintext_hex`, `plaintext_bytes`, `plaintext_text` (UTF-8
 Errors: an empty ciphertext or one whose length is not a multiple of 16, and malformed PKCS#7 padding, return HTTP 422 with
 `"type": "integrity_failure"`. A wrong key or tampered ciphertext often (not always) shows up as a padding error;
 CBC cannot distinguish "wrong key" from "corrupted data" reliably, and sometimes decrypts to garbage without any error.
+
+
+## POST `/api/encrypt/rsa-keyexchange`
+
+**Insecure educational RSA** (textbook RSA, tiny keys); every response has `insecure: true`. All large integers are exchanged
+as **decimal strings** (JavaScript numbers are exact only up to 2^53). Generates (or inspects) a key pair, encrypts, decrypts, and
+returns all the arithmetic.
+
+| field | type | default | notes |
+|-------|------|---------|-------|
+| `mode` | `"aes_key_wrap"` or `"integer"` | `aes_key_wrap` | `aes_key_wrap` carries a 128-bit AES key; `integer` encrypts a small integer (not real key transport) |
+| `modulus_bits` | even integer 12..512 | 160 (wrap) / 32 (integer) | wrap mode needs at least 130 so that n > 2^128; cannot be combined with `p`/`q` |
+| `p`, `q` | decimal strings | generated | supply both or neither; at most 78 digits and 256 bits each; must be distinct odd primes |
+| `e` | decimal string | 65537, else 257/17/5/3 | odd, 3 <= e < phi, coprime to phi |
+| `message` | decimal string | random (integer mode) | integer mode only; must be < n; no signs, spaces or leading zeros |
+| `aes_key_hex` | 32 hex digits | generated | wrap mode only |
+| `seed` | integer 0..2^32-1 | none | reproducible: primes are drawn first (from `random.Random(seed)`, p then q), then the AES key or random message. Insecure |
+| `include_traces` | boolean | true | omit the square-and-multiply traces |
+
+Response (abridged): `mode`, `insecure`, `security_note`, `real_world_minimum_modulus_bits` (2048), `textbook_notes`, `roles`,
+`key_source` (`generated` / `user_primes`), `seeded`, `modulus_bits`, `p`, `q`, `n`, `phi`, `e`, `d` (strings), `e_source`
+(`default` / `fallback` / `user`), `key_checks` (computed: primality of p and q, `n = p*q`, `phi`, `gcd(e, phi)`, `e*d mod phi`,
+`all_ok`), `primality` (per prime: method, bases, random bases, error bound, witness), `d_derivation` (the extended-Euclid
+steps, bounded), `message`, `message_bits`, `aes_key_hex` / `recovered_key_hex` (only for a server-generated demo key),
+`ciphertext`, `recovered`, `encryption` / `decryption` (square-and-multiply traces: `exponent_bits`, `initial`, `squarings`,
+`multiplications`, `steps[]` with `before`, `after_square`, `multiplied`, `after_multiply`, `result`; at most 64 steps are returned and
+`steps_total` / `steps_truncated` say how many exist), `verification` and `round_trip_ok` / `key_recovered_ok` (computed by
+decrypting and comparing; never assumed).
+
+**Secrets.** A key you supply is not echoed in `aes_key_hex`, `message` or `recovered`, but the traces contain the key as an integer
+(`encryption.initial`, `decryption.result`); send `"include_traces": false` to omit them. A generated demo key is returned
+because you need it. The server does not log request bodies or key material. The private exponent `d` (and `p`, `q`, `phi`) are
+returned because showing them is the purpose of the demonstration; use disposable keys only.
+
+**Errors** (HTTP 422, `validation_error`; `details[].field` names the parameter, and `details[].code` distinguishes
+`invalid_key_parameter` from request-model codes such as `string_too_long` or `value_error`): `p`/`q` not prime or not odd, `p == q`,
+`e` not coprime to phi or not smaller than phi, a message not smaller than `n`, a modulus too small to carry a 128-bit key (the key is
+never truncated), odd or out-of-range `modulus_bits`, `p` without `q`, conflicting fields.

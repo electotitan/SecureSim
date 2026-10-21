@@ -3,6 +3,7 @@
 Checkpoint 3: POST /api/encode/huffman, POST /api/encode/binary, error handling.
 """
 import json
+import pathlib
 import math
 
 import pytest
@@ -987,3 +988,554 @@ def test_aes_decrypt_api_trace_block_selects_the_requested_block():
         assert d["trace"]["output_hex"] == d["blocks"][i]["decrypted_hex"]
     err = assert_error(dec(ciphertext_hex=e["ciphertext_hex"], key_hex=KB, iv_hex=e["iv_hex"], trace_block=5), 422)
     assert err["details"][0]["field"] == "body.trace_block"
+
+
+# ====================================================================== Checkpoint 6: RSA endpoint
+from backend.models import MAX_RSA_STEPS_RETURNED
+from backend.pipeline import encryption_rsa as _rsa
+from backend.pipeline import decryption_rsa as _rsad
+
+RSA = "/api/encrypt/rsa-keyexchange"
+BIG_FIELDS = ("p", "q", "n", "phi", "e", "d", "ciphertext")
+
+
+def rsa_post(**body):
+    return client.post(RSA, json=body)
+
+
+def is_prime_ref(n):
+    """Independent reference primality test written with the built-in pow (test code only)."""
+    if n < 2:
+        return False
+    for sp in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if n % sp == 0:
+            return n == sp
+    d, s = n - 1, 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+    for a in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(s - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+# ------------------------------------------------------------------ the classic textbook example
+def test_rsa_api_classic_textbook_example_integer_mode():
+    d = rsa_post(mode="integer", p="61", q="53", e="17", message="65").json()
+    assert (d["n"], d["phi"], d["e"], d["d"]) == ("3233", "3120", "17", "2753")
+    assert d["ciphertext"] == "2790" and d["recovered"] == "65" and d["message"] == "65"
+    assert d["key_source"] == "user_primes" and d["e_source"] == "user" and d["seeded"] is False
+    assert d["round_trip_ok"] is True and d["key_recovered_ok"] is None and d["message_kind"] == "integer"
+    assert d["modulus_bits"] == 12 and d["message_bits"] == 7
+    assert d["d_derivation"]["equation"] == "e * d = 1 (mod phi):  17 * 2753 mod 3120 = 1"
+    assert d["key_checks"]["all_ok"] is True and d["key_checks"]["gcd_e_phi"] == "1"
+    assert d["key_checks"]["e_times_d_mod_phi"] == "1"
+
+
+def test_rsa_api_square_and_multiply_steps_are_the_real_arithmetic():
+    d = rsa_post(mode="integer", p="61", q="53", e="17", message="65").json()
+    enc = d["encryption"]
+    assert enc["exponent_bits"] == "10001" and enc["initial"] == "65" and enc["result"] == "2790"
+    assert enc["squarings"] == 4 and enc["multiplications"] == 1 and enc["steps_truncated"] is False
+    assert [(s["bit"], s["after_square"], s["after_multiply"]) for s in enc["steps"]] == [
+        (0, "992", "992"), (0, "1232", "1232"), (0, "1547", "1547"), (1, "789", "2790")]
+    value = int(enc["initial"])
+    for st in enc["steps"]:                                     # independent re-computation in the test
+        assert int(st["before"]) == value and int(st["after_square"]) == value * value % 3233
+        value = int(st["after_square"]) * 65 % 3233 if st["bit"] else int(st["after_square"])
+        assert int(st["after_multiply"]) == value
+    dec_ = d["decryption"]
+    assert dec_["exponent"] == "2753" and dec_["result"] == "65" and dec_["base"] == "2790"
+    assert dec_["exponent_bits"] == bin(2753)[2:]
+
+
+def test_rsa_api_extended_euclid_derivation_of_d():
+    d = rsa_post(mode="integer", p="61", q="53", e="17", message="65").json()["d_derivation"]
+    assert d["steps"] and d["steps"][-1]["remainder"] == "0" and d["steps_truncated"] is False
+    assert "extended Euclid" in d["method"]
+
+
+# ------------------------------------------------------------------ AES key transport (default mode)
+def test_rsa_api_default_mode_wraps_a_128_bit_aes_key_with_a_160_bit_modulus():
+    d = rsa_post(seed=1).json()
+    assert d["mode"] == "aes_key_wrap" and d["modulus_bits"] == 160 and d["message_kind"] == "aes_key_128"
+    n, e, dd, c = int(d["n"]), int(d["e"]), int(d["d"]), int(d["ciphertext"])
+    key = bytes.fromhex(d["aes_key_hex"])
+    m = int.from_bytes(key, "big")
+    assert len(key) == 16 and m < n and n > 2 ** 128                       # the whole key fits below the modulus
+    assert c == pow(m, e, n) and pow(c, dd, n) == m                         # independent verification
+    assert d["recovered_key_hex"] == d["aes_key_hex"] and d["key_recovered_ok"] is True
+    assert d["message"] == str(m) and d["recovered"] == str(m) and d["round_trip_ok"] is True
+
+
+def test_rsa_api_generated_numbers_are_mathematically_consistent():
+    d = rsa_post(seed=2).json()
+    p, q, n, phi, e, dd = (int(d[k]) for k in ("p", "q", "n", "phi", "e", "d"))
+    assert p != q and n == p * q and n.bit_length() == 160 and phi == (p - 1) * (q - 1)
+    assert is_prime_ref(p) and is_prime_ref(q)
+    assert math.gcd(e, phi) == 1 and 1 < e < phi and e * dd % phi == 1
+    assert d["p"] != d["q"] and d["e_source"] == "default" and e == 65537
+
+
+def test_rsa_api_all_large_integers_are_decimal_strings_not_json_numbers():
+    d = rsa_post(seed=3).json()
+    for k in BIG_FIELDS + ("message", "recovered"):
+        assert isinstance(d[k], str) and d[k].isdigit(), k
+    for part in ("encryption", "decryption"):
+        for k in ("base", "exponent", "modulus", "initial", "result"):
+            assert isinstance(d[part][k], str)
+        for st in d[part]["steps"]:
+            assert all(isinstance(st[k], str) for k in ("before", "after_square", "after_multiply"))
+    # every JSON number in the response is small enough for JavaScript to hold exactly
+    def numbers(x):
+        if isinstance(x, bool):
+            return
+        if isinstance(x, (int, float)):
+            yield x
+        elif isinstance(x, dict):
+            for v in x.values():
+                yield from numbers(v)
+        elif isinstance(x, list):
+            for v in x:
+                yield from numbers(v)
+    assert all(abs(v) < 2 ** 53 for v in numbers(d))
+
+
+def test_rsa_api_step_lists_are_bounded_but_counts_are_exact():
+    d = rsa_post(seed=4).json()
+    dec_ = d["decryption"]
+    assert dec_["steps_truncated"] is True and dec_["steps_returned"] == MAX_RSA_STEPS_RETURNED
+    assert len(dec_["steps"]) == MAX_RSA_STEPS_RETURNED
+    dd = int(d["d"])
+    assert dec_["steps_total"] == dd.bit_length() - 1 == dec_["squarings"]
+    assert dec_["multiplications"] == bin(dd).count("1") - 1
+    assert d["encryption"]["steps_truncated"] is False                      # 65537 has only 16 steps
+
+
+def test_rsa_api_labels_everything_insecure():
+    for body in ({"seed": 1}, {"mode": "integer"}, {"mode": "integer", "p": "61", "q": "53"}):
+        d = rsa_post(**body).json()
+        assert d["insecure"] is True and "INSECURE" in d["security_note"]
+        assert d["real_world_minimum_modulus_bits"] == 2048
+        assert any("padding" in n.lower() for n in d["textbook_notes"])
+        assert any("2^128" in n for n in d["textbook_notes"])
+        assert set(d["roles"]) == {"receiver", "sender", "receiver_decrypts"}
+
+
+def test_rsa_api_primality_report_describes_the_miller_rabin_strategy():
+    d = rsa_post(seed=5).json()
+    for who in ("p", "q"):
+        rep = d["primality"][who]
+        assert rep["is_prime"] is True and rep["method"] == "miller_rabin_deterministic"
+        assert rep["bases"] == [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41] and rep["witness"] is None
+    big = rsa_post(modulus_bits=512, seed=6).json()["primality"]["p"]
+    assert big["method"] == "miller_rabin_probabilistic" and big["random_bases"] == 20
+    assert big["error_bound"] == 4.0 ** -20 and len(big["bases"]) == 33
+
+
+# ------------------------------------------------------------------ integer mode
+def test_rsa_api_integer_mode_defaults_to_a_tiny_32_bit_modulus():
+    d = rsa_post(mode="integer", seed=7).json()
+    n, e, dd, c, m = (int(d[k]) for k in ("n", "e", "d", "ciphertext", "message"))
+    assert n.bit_length() == 32 and 2 <= m < n - 1
+    assert c == pow(m, e, n) and pow(c, dd, n) == m == int(d["recovered"])
+    assert d["aes_key_hex"] is None and d["recovered_key_hex"] is None and d["key_recovered_ok"] is None
+
+
+def test_rsa_api_integer_mode_with_supplied_message_and_generated_keys():
+    d = rsa_post(mode="integer", modulus_bits=64, message="123456789", seed=8).json()
+    assert d["message"] == "123456789" and d["modulus_bits"] == 64 and d["round_trip_ok"] is True
+    assert d["ciphertext"] == str(pow(123456789, int(d["e"]), int(d["n"])))
+
+
+def test_rsa_api_message_boundaries():
+    d = rsa_post(mode="integer", p="61", q="53", e="17", message="3232").json()
+    assert d["round_trip_ok"] and d["recovered"] == "3232"
+    d = rsa_post(mode="integer", p="61", q="53", e="17", message="0").json()
+    assert d["ciphertext"] == "0" and d["recovered"] == "0"
+    err = assert_error(rsa_post(mode="integer", p="61", q="53", e="17", message="3233"), 422)
+    assert err["details"][0]["field"] == "body.message" and "smaller than the modulus" in err["message"]
+
+
+def test_rsa_api_default_exponent_and_fallback_exponent_labels():
+    assert rsa_post(mode="integer", p="1000003", q="999983").json()["e_source"] == "default"
+    d = rsa_post(mode="integer", p="61", q="53").json()                    # phi = 3120 < 65537 -> a smaller standard e
+    assert d["e_source"] == "fallback" and int(d["e"]) in (257, 17, 5, 3) and d["round_trip_ok"]
+
+
+# ------------------------------------------------------------------ reproducibility
+def test_rsa_api_seed_reproduces_everything():
+    a, b = rsa_post(seed=42).json(), rsa_post(seed=42).json()
+    assert a == b and a["seeded"] is True
+    c = rsa_post(seed=43).json()
+    assert c["n"] != a["n"] and c["aes_key_hex"] != a["aes_key_hex"]
+
+
+def test_rsa_api_seed_contract_primes_then_aes_key_from_random_random():
+    rng = _random.Random(42)
+    pair = _rsa.generate_keypair(160, None, rng)                            # same draw order as documented
+    key = rng.randbytes(16)
+    d = rsa_post(seed=42).json()
+    assert (d["p"], d["q"], d["e"], d["d"]) == (str(pair.p), str(pair.q), str(pair.public.e), str(pair.private.d))
+    assert d["aes_key_hex"] == key.hex()
+
+
+def test_rsa_api_unseeded_generation_varies():
+    a, b = rsa_post().json(), rsa_post().json()
+    assert a["n"] != b["n"] and a["seeded"] is False
+
+
+def test_rsa_api_every_modulus_size_works():
+    for bits in (130, 132, 160, 256, 512):
+        d = rsa_post(modulus_bits=bits, seed=bits).json()
+        assert d["modulus_bits"] == bits and d["round_trip_ok"] and d["key_recovered_ok"] is True
+    for bits in (12, 14, 32, 64):
+        d = rsa_post(mode="integer", modulus_bits=bits, seed=bits).json()
+        assert d["modulus_bits"] == bits and d["round_trip_ok"] is True
+
+
+# ------------------------------------------------------------------ supplied AES key and secrets
+KEY = "000102030405060708090a0b0c0d0e0f"
+
+
+def test_rsa_api_supplied_aes_key_is_not_echoed_in_dedicated_fields():
+    r = rsa_post(seed=9, aes_key_hex=KEY, include_traces=False)
+    d = r.json()
+    assert d["aes_key_hex"] is None and d["recovered_key_hex"] is None and d["message"] is None
+    assert d["recovered"] is None and d["key_recovered_ok"] is True and d["round_trip_ok"] is True
+    assert KEY not in r.text and str(int(KEY, 16)) not in r.text
+    assert d["encryption"] is None and d["decryption"] is None
+
+
+def test_rsa_api_supplied_key_appears_only_inside_traces_when_traces_are_requested():
+    d = rsa_post(seed=9, aes_key_hex=KEY).json()
+    assert d["encryption"]["initial"] == str(int(KEY, 16))                  # documented: traces contain the key integer
+    stripped = {k: v for k, v in d.items() if k not in ("encryption", "decryption")}
+    assert str(int(KEY, 16)) not in json.dumps(stripped) and KEY not in json.dumps(stripped)
+    assert d["decryption"]["result"] == str(int(KEY, 16))
+
+
+def test_rsa_api_supplied_key_round_trips_against_independent_math():
+    d = rsa_post(seed=10, aes_key_hex=KEY).json()
+    n, e, dd, c = (int(d[k]) for k in ("n", "e", "d", "ciphertext"))
+    assert c == pow(int(KEY, 16), e, n) and pow(c, dd, n) == int(KEY, 16)
+
+
+def test_rsa_api_include_traces_false_in_integer_mode_omits_traces_only():
+    d = rsa_post(mode="integer", p="61", q="53", e="17", message="65", include_traces=False).json()
+    assert d["encryption"] is None and d["decryption"] is None and d["ciphertext"] == "2790"
+
+
+def test_rsa_api_does_not_log_private_key_material(caplog):
+    with caplog.at_level(logging.DEBUG):
+        d = rsa_post(seed=11).json()
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert d["d"] not in logged and d["p"] not in logged and d["aes_key_hex"] not in logged
+
+
+# ------------------------------------------------------------------ key-parameter validation
+@pytest.mark.parametrize("body, field, fragment", [
+    ({"mode": "integer", "p": "60", "q": "53"}, "body.p", "not prime"),
+    ({"mode": "integer", "p": "61", "q": "54"}, "body.q", "not prime"),
+    ({"mode": "integer", "p": "61", "q": "61"}, "body.q", "distinct"),
+    ({"mode": "integer", "p": "2", "q": "53"}, "body.p", "odd prime"),
+    ({"mode": "integer", "p": "1", "q": "53"}, "body.p", "odd prime"),
+    ({"mode": "integer", "p": "0", "q": "53"}, "body.p", "odd prime"),
+    ({"mode": "integer", "p": "561", "q": "61"}, "body.p", "not prime"),                      # Carmichael number
+    ({"mode": "integer", "p": "7", "q": "13", "e": "3"}, "body.e", "not coprime"),             # phi = 72
+    ({"mode": "integer", "p": "61", "q": "53", "e": "2"}, "body.e", "odd"),
+    ({"mode": "integer", "p": "61", "q": "53", "e": "1"}, "body.e", "odd"),
+    ({"mode": "integer", "p": "61", "q": "53", "e": "3121"}, "body.e", "smaller than phi"),
+    ({"mode": "integer", "p": "61", "q": "53", "e": "99999999999999"}, "body.e", "smaller than phi"),
+    ({"mode": "integer", "modulus_bits": 32, "e": "4"}, "body.e", "odd"),
+    ({"mode": "integer", "modulus_bits": 12, "e": "9999999999"}, "body.e", None),
+    ({"p": "10" + "0" * 76 + "7", "q": "61"}, None, None),                                     # 79 digits: too long for the field
+])
+def test_rsa_api_invalid_key_parameters_are_clear_validation_errors(body, field, fragment):
+    err = assert_error(rsa_post(**body), 422)
+    if field:
+        assert err["details"] and err["details"][0]["field"] == field
+    if fragment:
+        assert fragment in err["message"]
+
+
+def test_rsa_api_oversized_prime_rejected_by_bit_length_not_just_digits():
+    big_prime_dec = str(2 ** 257 + 297) if False else None
+    p = (1 << 259) | 1                                      # 260 bits, 79 digits -> rejected by the field limit
+    assert_error(rsa_post(mode="integer", p=str(p), q="61"), 422)
+    p256 = (1 << 257) + 1                                   # 258 bits, 78 digits: passes the digit limit
+    err = assert_error(rsa_post(mode="integer", p=str(p256), q="61"), 422)
+    assert err["details"][0]["field"] == "body.p" and "too large" in err["message"]
+
+
+def test_rsa_api_user_primes_at_the_size_limit_work():
+    p = _rsa.generate_prime(256, _random.Random(1))
+    q = _rsa.generate_prime(256, _random.Random(2))
+    d = rsa_post(mode="integer", p=str(p), q=str(q), message="123456789").json()
+    assert d["modulus_bits"] in (511, 512) and d["round_trip_ok"] is True
+    assert d["primality"]["p"]["method"] == "miller_rabin_probabilistic"
+
+
+def test_rsa_api_aes_key_wrap_requires_a_modulus_that_can_carry_the_key():
+    for bits in (12, 64, 128):
+        err = assert_error(rsa_post(modulus_bits=bits), 422)
+        assert err["details"][0]["field"] == "body.modulus_bits" and "2^128" in err["message"]
+    assert rsa_post(modulus_bits=130, seed=1).status_code == 200          # smallest accepted
+
+
+def test_rsa_api_user_primes_too_small_for_the_key_are_rejected_not_truncated():
+    err = assert_error(rsa_post(p="1000003", q="999983", aes_key_hex="ff" * 16), 422)
+    assert err["details"][0]["field"] == "body.p" and "does not fit" in err["message"]
+    assert "ffffffff" not in json.dumps(err)                               # the key is not echoed in the error
+
+
+@pytest.mark.parametrize("body, field", [
+    ({"modulus_bits": 11}, "body.modulus_bits"), ({"modulus_bits": 13}, "body.modulus_bits"),
+    ({"modulus_bits": 513}, "body.modulus_bits"), ({"modulus_bits": 1024}, "body.modulus_bits"),
+    ({"modulus_bits": 0}, "body.modulus_bits"), ({"modulus_bits": -32}, "body.modulus_bits"),
+    ({"modulus_bits": 32.0}, "body.modulus_bits"), ({"modulus_bits": "32"}, "body.modulus_bits"),
+    ({"modulus_bits": True}, "body.modulus_bits"),
+    ({"mode": "AES"}, "body.mode"), ({"mode": 5}, "body.mode"), ({"mode": None}, "body.mode"),
+    ({"mode": "integer", "message": "abc"}, "body.message"),
+    ({"mode": "integer", "message": "-5"}, "body.message"),
+    ({"mode": "integer", "message": "1e3"}, "body.message"),
+    ({"mode": "integer", "message": " 5"}, "body.message"),
+    ({"mode": "integer", "message": "05"}, "body.message"),
+    ({"mode": "integer", "message": "1_000"}, "body.message"),
+    ({"mode": "integer", "message": ""}, "body.message"),
+    ({"mode": "integer", "message": 65}, "body.message"),
+    ({"mode": "integer", "message": "1" * 161}, "body.message"),
+    ({"mode": "integer", "p": "6a", "q": "53"}, "body.p"),
+    ({"mode": "integer", "p": 61, "q": "53"}, "body.p"),
+    ({"mode": "integer", "p": "61", "q": "+53"}, "body.q"),
+    ({"mode": "integer", "p": "61", "q": "53", "e": "0x11"}, "body.e"),
+    ({"mode": "integer", "p": "61", "q": "53", "e": 17}, "body.e"),
+    ({"aes_key_hex": "00" * 15}, "body.aes_key_hex"), ({"aes_key_hex": "zz" * 16}, "body.aes_key_hex"),
+    ({"aes_key_hex": 12}, "body.aes_key_hex"),
+    ({"seed": -1}, "body.seed"), ({"seed": 2 ** 32}, "body.seed"), ({"seed": 1.5}, "body.seed"),
+    ({"seed": True}, "body.seed"), ({"seed": "7"}, "body.seed"),
+    ({"include_traces": "yes"}, "body.include_traces"), ({"include_traces": 1}, "body.include_traces"),
+])
+def test_rsa_api_validation_errors_name_the_field(body, field):
+    err = assert_error(rsa_post(**body), 422)
+    assert err["details"] and err["details"][0]["field"] == field
+
+
+@pytest.mark.parametrize("body, fragment", [
+    ({"p": "61"}, "both 'p' and 'q'"),
+    ({"q": "53"}, "both 'p' and 'q'"),
+    ({"p": "61", "q": "53", "modulus_bits": 32}, "cannot be combined"),
+    ({"mode": "integer", "aes_key_hex": "00" * 16}, "only valid with mode 'aes_key_wrap'"),
+    ({"mode": "aes_key_wrap", "message": "5"}, "only valid with mode 'integer'"),
+    ({"message": "5"}, "only valid with mode 'integer'"),
+])
+def test_rsa_api_conflicting_fields_rejected(body, fragment):
+    err = assert_error(rsa_post(**body), 422)
+    assert err["details"][0]["field"] == "body" and fragment in err["details"][0]["message"]
+
+
+def test_rsa_api_extra_fields_malformed_json_and_methods():
+    assert_error(rsa_post(bogus=1), 422)
+    assert_error(client.post(RSA, content="{nope", headers={"content-type": "application/json"}), 422)
+    assert_error(client.get(RSA), 405, "http_error")
+    big = json.dumps({"mode": "integer", "message": "1" * (MAX_BODY_BYTES + 10)})
+    assert_error(client.post(RSA, content=big, headers={"content-type": "application/json"}), 413)
+    assert rsa_post().status_code == 200                                    # empty body {} uses all defaults
+
+
+def test_rsa_api_errors_do_not_echo_private_values():
+    secret_key = "11" * 16
+    r = rsa_post(seed=1, aes_key_hex=secret_key, modulus_bits=13)
+    assert r.status_code == 422 and secret_key not in r.text and str(int(secret_key, 16)) not in r.text
+
+
+# ------------------------------------------------------------------ honesty of computed flags
+def test_rsa_api_round_trip_flag_is_computed_not_hardcoded(monkeypatch):
+    import backend.main as m
+    monkeypatch.setattr(m.decryption_rsa, "rsa_decrypt", lambda c, k: 12345)
+    d = rsa_post(mode="integer", p="61", q="53", e="17", message="65").json()
+    assert d["round_trip_ok"] is False and d["verification"]["round_trip_ok"] is False
+
+
+def test_rsa_api_key_recovered_flag_is_computed_not_hardcoded(monkeypatch):
+    import backend.main as m
+    monkeypatch.setattr(m.decryption_rsa, "rsa_unwrap_key", lambda c, k, n: b"\x00" * 16)
+    assert rsa_post(seed=1).json()["key_recovered_ok"] is False
+
+
+def test_rsa_api_key_recovered_false_when_unwrap_raises(monkeypatch):
+    import backend.main as m
+
+    def boom(c, k, n):
+        raise ValueError("does not fit")
+
+    monkeypatch.setattr(m.decryption_rsa, "rsa_unwrap_key", boom)
+    d = rsa_post(seed=1).json()
+    assert d["key_recovered_ok"] is False and d["recovered_key_hex"] is None
+
+
+def test_rsa_api_trace_consistency_flag_is_computed(monkeypatch):
+    import backend.main as m
+    real = m.encryption_rsa.rsa_encrypt_trace
+
+    def tampered(msg, pub):
+        t = real(msg, pub)
+        t["result"] += 1
+        return t
+
+    monkeypatch.setattr(m.encryption_rsa, "rsa_encrypt_trace", tampered)
+    assert rsa_post(seed=1).json()["verification"]["encryption_trace_matches_ciphertext"] is False
+
+
+def test_rsa_api_key_checks_are_really_computed(monkeypatch):
+    import backend.main as m
+    monkeypatch.setattr(m.encryption_rsa, "is_prime", lambda n, *a, **k: False)
+    d = rsa_post(mode="integer", p="61", q="53", e="17", message="65")
+    assert d.status_code == 422                                              # keypair validation uses is_prime
+    monkeypatch.undo()
+    ok = rsa_post(mode="integer", p="61", q="53", e="17", message="65").json()["key_checks"]
+    assert ok["p_is_prime"] and ok["q_is_prime"] and ok["n_equals_p_times_q"] and ok["phi_equals_p1_times_q1"]
+
+
+def test_rsa_api_unexpected_crash_is_clean_500_without_private_values(monkeypatch):
+    import backend.main as m
+
+    def crash(*a, **k):
+        raise RuntimeError("secret d=123456789 /srv/rsa.py")
+
+    monkeypatch.setattr(m.encryption_rsa, "generate_keypair", crash)
+    r = TestClient(app, raise_server_exceptions=False).post(RSA, json={"seed": 1})
+    err = assert_error(r, 500, "internal_error")
+    assert "123456789" not in r.text and err["message"] == "Internal server error."
+
+
+def test_rsa_api_listed_in_openapi_and_version_bumped():
+    assert "post" in client.get("/openapi.json").json()["paths"][RSA]
+
+
+def test_rsa_api_modules_are_the_only_rsa_math_used():
+    src = (pathlib.Path(__file__).resolve().parent.parent / "backend" / "main.py").read_text()
+    assert "pow(" not in src.replace("gf_pow(", "")                           # the API never calls built-in pow
+
+
+# ------------------------------------------------------------------ gap-closing tests (found by mutation testing)
+def test_rsa_api_euclid_derivation_steps_are_truncated_for_a_huge_exponent():
+    e = 2 ** 255 - 19                                       # a 255-bit prime exponent -> many Euclid steps
+    d = rsa_post(modulus_bits=512, e=str(e), seed=1).json()
+    dd = d["d_derivation"]
+    phi = int(d["phi"])
+    a, b, count = e % phi, phi, 0                           # independent step count
+    while b:
+        a, b, count = b, a % b, count + 1
+    assert dd["steps_total"] == count > MAX_RSA_STEPS_RETURNED
+    assert dd["steps_truncated"] is True and dd["steps_returned"] == len(dd["steps"]) == MAX_RSA_STEPS_RETURNED
+    assert d["e_source"] == "user" and d["round_trip_ok"] is True and int(d["e"]) == e
+    small = rsa_post(mode="integer", p="61", q="53", e="17").json()["d_derivation"]
+    assert small["steps_truncated"] is False and small["steps_returned"] == small["steps_total"]
+
+
+def test_rsa_api_round_trip_flag_requires_the_decryption_trace_to_agree(monkeypatch):
+    import backend.main as m
+    real = m.decryption_rsa.rsa_decrypt_trace
+
+    def tampered(c, k):
+        t = real(c, k)
+        t["result"] += 1
+        return t
+
+    monkeypatch.setattr(m.decryption_rsa, "rsa_decrypt_trace", tampered)
+    d = rsa_post(mode="integer", p="61", q="53", e="17", message="65").json()
+    assert d["round_trip_ok"] is False and d["verification"]["round_trip_ok"] is False
+
+
+def test_rsa_api_checks_detect_a_wrong_private_exponent(monkeypatch):
+    import backend.main as m
+    real = m.encryption_rsa.keypair_from_primes
+
+    def fake(p, q, e=None):
+        pair = real(p, q, e)
+        return _rsa.RSAKeyPair(pair.public, _rsa.PrivateKey(pair.public.n, pair.private.d + 1),
+                               pair.p, pair.q, pair.phi, pair.e_source, pair.d_steps)
+
+    monkeypatch.setattr(m.encryption_rsa, "keypair_from_primes", fake)
+    d = rsa_post(mode="integer", p="61", q="53", e="17", message="65").json()
+    wrong = str(17 * 2754 % 3120)
+    assert wrong == "18" and d["key_checks"]["e_times_d_mod_phi"] == "18"
+    assert d["key_checks"]["all_ok"] is False and d["verification"]["key_checks_all_ok"] is False
+    assert d["d_derivation"]["equation"].endswith("= 18")
+    assert d["round_trip_ok"] is False and d["recovered"] != "65"
+
+
+def test_rsa_api_primality_check_in_key_checks_is_computed(monkeypatch):
+    import backend.main as m
+    real, calls = m.encryption_rsa.is_prime, {"n": 0}
+
+    def flaky(n, *a, **k):                                  # honest while the key is built, then lies
+        calls["n"] += 1
+        return real(n) if calls["n"] <= 2 else False
+
+    monkeypatch.setattr(m.encryption_rsa, "is_prime", flaky)
+    d = rsa_post(mode="integer", p="61", q="53", e="17", message="65").json()
+    assert d["key_checks"]["p_is_prime"] is False and d["key_checks"]["q_is_prime"] is False
+    assert d["key_checks"]["all_ok"] is False and d["verification"]["key_checks_all_ok"] is False
+
+
+def test_rsa_api_gcd_check_in_key_checks_is_computed(monkeypatch):
+    import backend.main as m
+    real, calls = m.encryption_rsa.extended_gcd, {"n": 0}
+
+    def flaky(a, b):
+        calls["n"] += 1
+        return real(a, b) if calls["n"] <= 1 else (7, 0, 0)
+
+    monkeypatch.setattr(m.encryption_rsa, "extended_gcd", flaky)
+    d = rsa_post(mode="integer", p="61", q="53", e="17", message="65").json()
+    assert d["key_checks"]["gcd_e_phi"] == "7" and d["key_checks"]["all_ok"] is False
+
+
+def test_rsa_api_primality_reports_belong_to_the_right_prime():
+    d = rsa_post(mode="integer", p="61", q="1000003", e="17").json()["primality"]
+    assert d["p"]["method"] == "trial_division" and d["q"]["method"] == "miller_rabin_deterministic"
+    d = rsa_post(mode="integer", p="1000003", q="61", e="17").json()["primality"]
+    assert d["p"]["method"] == "miller_rabin_deterministic" and d["q"]["method"] == "trial_division"
+
+
+@pytest.mark.parametrize("bits, code", [(13, "value_error"), (15, "value_error"), (11, "greater_than_equal"),
+                                          (10, "greater_than_equal"), (2, "greater_than_equal"), (0, "greater_than_equal"),
+                                          (-32, "greater_than_equal"), (514, "less_than_equal"), (1024, "less_than_equal")])
+def test_rsa_api_modulus_bits_are_rejected_by_the_request_model_itself(bits, code):
+    err = assert_error(rsa_post(mode="integer", modulus_bits=bits), 422)
+    assert err["details"][0]["field"] == "body.modulus_bits" and err["details"][0]["code"] == code
+
+
+@pytest.mark.parametrize("bad", ["32", 32.0, 32.5, True, [32], None if False else "x"])
+def test_rsa_api_modulus_bits_must_be_a_real_integer_even_where_32_is_a_legal_size(bad):
+    # In integer mode 32 bits is valid, so a lenient parser would accept "32" or 32.0 -> only strictness rejects them.
+    err = assert_error(rsa_post(mode="integer", modulus_bits=bad), 422)
+    assert err["details"][0]["field"] == "body.modulus_bits" and err["details"][0]["code"] != "invalid_key_parameter"
+    assert rsa_post(mode="integer", modulus_bits=32, seed=1).status_code == 200
+
+
+@pytest.mark.parametrize("field, value", [("p", "1" * 79), ("q", "1" * 79), ("e", "1" * 79), ("message", "1" * 161)])
+def test_rsa_api_digit_limits_are_enforced_by_the_request_model(field, value):
+    body = {"mode": "integer", field: value}
+    if field in ("p", "q"):
+        body["q" if field == "p" else "p"] = "61"
+    err = assert_error(rsa_post(**body), 422)
+    assert err["details"][0]["field"] == f"body.{field}" and err["details"][0]["code"] == "string_too_long"
+
+
+def test_rsa_api_limits_accept_exactly_the_maximum_digits_at_the_model_layer():
+    # 78-digit p passes the model; the algorithm layer (bit length) then decides.
+    err = assert_error(rsa_post(mode="integer", p="9" * 78, q="61"), 422)
+    assert err["details"][0]["code"] == "invalid_key_parameter"
+    err = assert_error(rsa_post(mode="integer", p="61", q="53", e="17", message="9" * 160), 422)
+    assert err["details"][0]["code"] == "message_too_large"

@@ -37,6 +37,7 @@ Troubleshooting: if collection stops with *"starlette.testclient requires the ht
 `httpx` nor `httpx2` installed. It is an environment problem, not a code problem: activate the project's
 venv and run `pip install -r requirements.txt`. (Reproduced and fixed during Checkpoint 5.)
 
+
 ## Quick start
 
     python -m venv .venv && source .venv/bin/activate
