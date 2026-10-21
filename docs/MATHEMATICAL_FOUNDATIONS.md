@@ -1,6 +1,6 @@
 # Mathematical Foundations
 
-> Grows stage by stage. Current sections: GF(2^8) and the AES S-box (Checkpoint 2); Huffman coding and binary representation (Checkpoint 3); LZ77 compression (Checkpoint 4); AES-128 (Checkpoint 5).
+> Grows stage by stage. Current sections: GF(2^8) and the AES S-box (Checkpoint 2); Huffman coding and binary representation (Checkpoint 3); LZ77 compression (Checkpoint 4); AES-128 (Checkpoint 5); RSA key exchange (Checkpoint 6).
 
 ## 1. The finite field GF(2^8)
 
@@ -286,3 +286,106 @@ Properties demonstrated by the tests:
   between 56 and 72 of 128 ciphertext bits on average (the full avalanche experiment is a later checkpoint).
 
 Only AES-128 is implemented. Requests for AES-192/256 receive HTTP 501 (`unsupported_operation`).
+
+
+---
+
+## 8. RSA key exchange (Stage 5)
+
+> **Educational and insecure.** This is *textbook* RSA: no padding (no OAEP), tiny keys. Every API response is labelled
+> `insecure: true`. Real RSA needs a modulus of at least 2048 bits, OAEP padding and a vetted library. Even the 160-bit moduli
+> used below to carry a 128-bit AES key can be factored almost instantly.
+
+**Key generation.** Choose distinct odd primes `p`, `q`; `n = p*q`; `phi(n) = (p-1)(q-1)`. Choose `e` with `1 < e < phi` and
+`gcd(e, phi) = 1` (default 65537, falling back to 257, 17, 5, 3 when `phi` is too small or shares a factor). Compute
+`d = e^-1 (mod phi)` with the extended Euclidean algorithm, so `e*d = 1 + k*phi`. Here `bits` means the **modulus** size
+(even, 12 to 1024); `p` and `q` have `bits/2` bits with their top two bits set, so `n` has exactly `bits` bits.
+
+**Encryption and decryption.** For an integer `0 <= m < n`: `c = m^e mod n` and `m = c^d mod n`.
+
+**Why decryption works (for every m).** For a prime `r` in `{p, q}`: if `r` does not divide `m`, Fermat's little theorem gives
+`m^(r-1) = 1 (mod r)`; since `(r-1)` divides `e*d - 1 = k*phi`, `m^(ed) = m * (m^(r-1))^j = m (mod r)`. If `r` divides `m`, both sides
+are `0 (mod r)`. Because `n` is squarefree, the Chinese remainder theorem gives `m^(ed) = m (mod n)`, including for `m` not
+coprime to `n` (the tests check all 143 residues of `n = 11*13` and all 3233 of `n = 61*53`).
+
+### Worked example (the classic one; produced by the running code)
+
+`p = 61, q = 53, e = 17`: `n = 3233`, `phi = 3120`, `d = 2753`.
+
+Computing `d` by the extended Euclidean algorithm on `(17, 3120)` (columns: quotient, remainder, and the coefficients
+`x, y` after each step with `17*x + 3120*y = remainder`):
+
+| step | quotient | remainder | x | y |
+|-----:|---------:|----------:|--:|--:|
+| 1 | 0 | 17 | 1 | 0 |
+| 2 | 183 | 9 | -183 | 1 |
+| 3 | 1 | 8 | 184 | -1 |
+| 4 | 1 | 1 | -367 | 2 |
+| 5 | 8 | 0 | 3120 | -17 |
+
+The last nonzero remainder is `1`, and `x mod 3120 = 2753`, so `d = 2753` and `17 * 2753 mod 3120 = 1`.
+
+**Square-and-multiply** computes `65^17 mod 3233`. `17` is `10001` in binary. The leading `1` loads the base (`65`); each later
+bit squares, and also multiplies by the base when the bit is `1`:
+
+| step | bit | before | after square | multiply? | after multiply |
+|-----:|----:|-------:|-------------:|:---------:|---------------:|
+| 1 | 0 | 65 | 992 | no | 992 |
+| 2 | 0 | 992 | 1232 | no | 1232 |
+| 3 | 0 | 1232 | 1547 | no | 1547 |
+| 4 | 1 | 1547 | 789 | yes | 2790 |
+
+Ciphertext `c = 2790` after 4 squarings and 1 multiplication (versus 16 multiplications for naive
+repeated multiplication). Decryption computes `2790^2753 mod 3233` in 11 squarings and 4 multiplications and returns `65`.
+In general `exponent_bits - 1` squarings plus `popcount - 1` multiplications are needed: `O(log e)` modular multiplications.
+
+### Miller-Rabin primality testing
+
+Write `n - 1 = 2^s * d` with `d` odd. A base `a` is a **witness** that `n` is composite if `a^d != 1` and `a^(d*2^r) != -1 (mod n)`
+for all `0 <= r < s`. For a prime no witness exists; for an odd composite at least 3/4 of all bases are witnesses.
+
+Strategy implemented (and why):
+1. Trial division by the primes below 100 (found by a sieve). If no factor is found and `n < 101^2 = 10201`, `n` is prime.
+2. For `n < 3,317,044,064,679,887,385,961,981` the first 13 prime bases (2, 3, ..., 41) are a **proven** deterministic test
+   (Sorenson and Webster, 2015).
+3. For larger `n` the same 13 bases are used plus 20 random bases. Each random base lets a composite through with probability
+   at most 1/4, so a composite is accepted with probability below `4^-20 = 9.095e-13`; a prime is always accepted.
+
+Two concrete illustrations (computed by the code):
+* `n = 3215031751 = 151 * 751 * 28351` has `n - 1 = 2^1 * 1607515875`. It is a strong pseudoprime to the bases 2, 3, 5, 7
+  (`a^d mod n` is 2: 1, 3: 3215031750, 5: 1, 7: 3215031750, i.e. `1` or `n - 1`), but base 11 gives `2129160099`, which exposes it. A test with only the first four primes would be fooled.
+  Its factors are all above 100, so trial division cannot reject it.
+* `n = 3317044064679887385961981` (the deterministic bound itself) is the smallest composite that passes **all 13** fixed
+  bases. The random bases catch it (witness 305178576366315321245234 in a seeded run); with zero random rounds it would be wrongly accepted
+  (checked by a test), which is why those rounds exist.
+
+Carmichael numbers (`a^(n-1) = 1` for all `a` coprime to `n`) fool the Fermat test but not Miller-Rabin; the tests use
+Carmichael numbers whose prime factors are all above 100 (for example `211*421*631 = 56052361`) so that Miller-Rabin itself, not trial
+division, must reject them.
+
+### Key transport and why a 128-bit key needs a bigger modulus
+
+Raw RSA only handles integers smaller than `n`. A 16-byte AES key is an integer up to `2^128 - 1`, so the modulus must exceed
+`2^128` (at least 129 bits; the API requires at least 130 because moduli have an even number of bits and defaults to 160).
+`rsa_wrap_key` **refuses** a key whose integer value is `>= n` (tested at exactly `n`, `n-1`, `n+1`) instead of silently
+reducing it modulo `n`, which would make the key unrecoverable. Decryption also refuses an integer that does not fit the key
+length. The alternative shown by `mode: "integer"` is a deliberately simplified demonstration with a small integer, **not** real
+key transport.
+
+### Textbook-RSA weaknesses (each demonstrated by a test)
+
+* Deterministic: equal messages give equal ciphertexts (no probabilistic padding).
+* Malleable: `E(a) * E(b) mod n = E(a*b mod n)`.
+* `0`, `1` and `n - 1` are fixed points; encryption is a permutation of the residues mod `n`.
+* Tiny keys: factoring `n` reveals `phi` and therefore `d`.
+
+OAEP is **not** implemented: it would require the mask-generation function and a hash implemented from first principles.
+
+### Implementation restrictions (enforced by tests)
+
+Modular exponentiation never uses Python's built-in three-argument `pow` (an AST-based test checks the RSA modules and `main.py`);
+`pow` appears only in tests, as an independent reference, together with `math.gcd`. No `math`, `hashlib`, `Crypto`,
+`cryptography` or `sympy` import is allowed in the RSA modules, which are also independent of the AES message path.
+
+Measured with the running code: a 160-bit key pair is generated in about a millisecond and a 512-bit key pair in about 0.04 s
+(including the HTTP round trip and a 54 KB response).

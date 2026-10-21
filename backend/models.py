@@ -6,6 +6,7 @@ request-body cap in ``main.py`` (HTTP 413).
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
@@ -20,6 +21,14 @@ MAX_LZ77_BYTES = 40_000          # bytes accepted by the LZ77 endpoint (= 10,000
 MAX_TOKENS_RETURNED = 2_000      # per-token records returned (statistics always cover ALL tokens)
 MAX_AES_BYTES = 40_000           # plaintext bytes accepted by the AES endpoint
 MAX_AES_BLOCKS_RETURNED = 64     # per-block records returned (the ciphertext is always complete)
+MAX_RSA_MODULUS_BITS = 512       # largest modulus the API will generate
+MAX_RSA_PRIME_BITS = 256         # largest user-supplied prime (p, q)
+MAX_RSA_STEPS_RETURNED = 64      # square-and-multiply / Euclid steps returned per computation
+DEFAULT_RSA_WRAP_BITS = 160      # default modulus when carrying a 128-bit AES key (n must exceed 2^128)
+DEFAULT_RSA_INTEGER_BITS = 32    # default tiny modulus for the integer demonstration
+MIN_RSA_WRAP_BITS = 130          # smallest generated modulus guaranteed to exceed any 128-bit key
+MAX_DECIMAL_DIGITS = 78          # decimal strings for p, q, e (<= 259 bits)
+MAX_MESSAGE_DIGITS = 160         # decimal string for the integer message
 
 
 class StrictModel(BaseModel):
@@ -337,3 +346,121 @@ class AESDecryptResponse(BaseModel):
     trace: Optional[dict[str, Any]]
     trace_block: Optional[int]
     warning: str
+
+
+# --------------------------------------------------------------------------- Stage 5: RSA key exchange
+_DECIMAL_RE = re.compile(r"^(0|[1-9][0-9]*)$")
+
+
+def _check_decimal(v: str, name: str) -> str:
+    if not _DECIMAL_RE.match(v):
+        raise ValueError(f"{name} must be a non-negative integer written in decimal digits "
+                         f"(no sign, spaces, separators or leading zeros)")
+    return v
+
+
+class RSAKeyExchangeRequest(StrictModel):
+    """Educational RSA demonstration. All large integers are exchanged as DECIMAL STRINGS because
+    JavaScript cannot represent integers above 2^53 exactly.
+
+    ``mode`` ``aes_key_wrap``: encrypt a 128-bit AES key (integer < n) with the receiver's public key.
+    ``mode`` ``integer``: encrypt a small integer message < n (tiny keys; NOT real key transport).
+    Supply either ``modulus_bits`` (generate keys) or both ``p`` and ``q`` (inspect your own primes).
+    """
+    mode: str = "aes_key_wrap"
+    modulus_bits: Optional[StrictInt] = Field(None, ge=12, le=MAX_RSA_MODULUS_BITS,
+                                              description="Even; default 160 (aes_key_wrap) or 32 (integer).")
+    p: Optional[str] = Field(None, max_length=MAX_DECIMAL_DIGITS)
+    q: Optional[str] = Field(None, max_length=MAX_DECIMAL_DIGITS)
+    e: Optional[str] = Field(None, max_length=MAX_DECIMAL_DIGITS)
+    message: Optional[str] = Field(None, max_length=MAX_MESSAGE_DIGITS)
+    aes_key_hex: Optional[str] = Field(None, min_length=32, max_length=32)
+    seed: Optional[StrictInt] = Field(None, ge=0, le=2 ** 32 - 1)
+    include_traces: StrictBool = Field(
+        True, description="Square-and-multiply traces contain the message integer (for aes_key_wrap: the key). "
+                          "Set false to omit them.")
+
+    @field_validator("mode")
+    @classmethod
+    def _mode_known(cls, v: str) -> str:
+        if v not in ("aes_key_wrap", "integer"):
+            raise ValueError("mode must be 'aes_key_wrap' or 'integer'")
+        return v
+
+    @field_validator("modulus_bits")
+    @classmethod
+    def _bits_even(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v % 2:
+            raise ValueError("modulus_bits must be even (n is the product of two primes of equal size)")
+        return v
+
+    @field_validator("p")
+    @classmethod
+    def _p_decimal(cls, v: Optional[str]) -> Optional[str]:
+        return _check_decimal(v, "p") if v is not None else v
+
+    @field_validator("q")
+    @classmethod
+    def _q_decimal(cls, v: Optional[str]) -> Optional[str]:
+        return _check_decimal(v, "q") if v is not None else v
+
+    @field_validator("e")
+    @classmethod
+    def _e_decimal(cls, v: Optional[str]) -> Optional[str]:
+        return _check_decimal(v, "e") if v is not None else v
+
+    @field_validator("message")
+    @classmethod
+    def _message_decimal(cls, v: Optional[str]) -> Optional[str]:
+        return _check_decimal(v, "message") if v is not None else v
+
+    @field_validator("aes_key_hex")
+    @classmethod
+    def _key_hex(cls, v: Optional[str]) -> Optional[str]:
+        return _check_hex(v, "aes_key_hex") if v is not None else v
+
+    @model_validator(mode="after")
+    def _consistent_fields(self) -> "RSAKeyExchangeRequest":
+        if (self.p is None) != (self.q is None):
+            raise ValueError("provide both 'p' and 'q', or neither")
+        if self.p is not None and self.modulus_bits is not None:
+            raise ValueError("'modulus_bits' cannot be combined with explicit 'p' and 'q'")
+        if self.mode == "integer" and self.aes_key_hex is not None:
+            raise ValueError("'aes_key_hex' is only valid with mode 'aes_key_wrap'")
+        if self.mode == "aes_key_wrap" and self.message is not None:
+            raise ValueError("'message' is only valid with mode 'integer'")
+        return self
+
+
+class RSAKeyExchangeResponse(BaseModel):
+    mode: str
+    insecure: bool = Field(description="Always true: educational textbook RSA with tiny keys.")
+    security_note: str
+    real_world_minimum_modulus_bits: int
+    textbook_notes: list[str]
+    roles: dict[str, str]
+    key_source: str = Field(description="'generated' or 'user_primes'")
+    seeded: bool
+    modulus_bits: int
+    p: str
+    q: str
+    n: str
+    phi: str
+    e: str
+    d: str
+    e_source: str = Field(description="'default' (65537), 'fallback' (smaller standard exponent) or 'user'")
+    key_checks: dict[str, Any]
+    primality: dict[str, Any]
+    d_derivation: dict[str, Any]
+    message_kind: str
+    message: Optional[str] = Field(description="The integer being encrypted (null for a supplied AES key).")
+    message_bits: int
+    aes_key_hex: Optional[str] = Field(description="Only when the server generated the demo AES key.")
+    recovered_key_hex: Optional[str] = Field(description="Only when the server generated the demo AES key.")
+    ciphertext: str
+    recovered: Optional[str] = Field(description="Decrypted integer as a decimal string; null when a SUPPLIED aes_key_hex is being carried.")
+    encryption: Optional[dict[str, Any]]
+    decryption: Optional[dict[str, Any]]
+    verification: dict[str, Any]
+    round_trip_ok: bool
+    key_recovered_ok: Optional[bool]
