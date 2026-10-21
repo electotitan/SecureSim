@@ -1,0 +1,26 @@
+Check-Point 3
+curl -s -X POST http://127.0.0.1:8000/api/encode/huffman \
+  -H 'content-type: application/json' -d '{"text":"ABBCCC"}'
+
+Result
+You should get "bitstring":"101111000", entropy about 1.459, average length 1.5 and efficiency about 97.28%.
+
+Check-Point 4
+curl -s -X POST http://127.0.0.1:8000/api/compress/lz77 -H 'content-type: application/json' -d '{"text":"aaaa"}'
+
+Result
+Expect tokens (0,0,"61") and (1,3,""), compressed_bytes: 7, and expanded: true
+
+Check-Point 5
+curl -s -X POST http://127.0.0.1:8000/api/encrypt/aes -H 'content-type: application/json' \
+ -d '{"data_hex":"00112233445566778899aabbccddeeff","key_hex":"000102030405060708090a0b0c0d0e0f","iv_hex":"00000000000000000000000000000000","include_trace":false}'
+
+ Result
+ Expect first block 69c4e0d86a7b0430d8cdb78070b4c55a
+
+ Check-Point 6
+curl -s -X POST http://127.0.0.1:8000/api/encrypt/rsa-keyexchange -H 'content-type: application/json' \
+ -d '{"mode":"integer","p":"61","q":"53","e":"17","message":"65"}'
+
+ Result
+ Expect "n":"3233", "d":"2753", "ciphertext":"2790", "recovered":"65" and "insecure":true. The numbers come back as strings on purpose, so JavaScript can’t corrupt large values
