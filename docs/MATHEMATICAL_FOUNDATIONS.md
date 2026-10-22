@@ -1,6 +1,6 @@
 # Mathematical Foundations
 
-> Grows stage by stage. Current sections: GF(2^8) and the AES S-box (Checkpoint 2); Huffman coding and binary representation (Checkpoint 3); LZ77 compression (Checkpoint 4); AES-128 (Checkpoint 5); RSA key exchange (Checkpoint 6).
+> Grows stage by stage. Current sections: GF(2^8) and the AES S-box (Checkpoint 2); Huffman coding and binary representation (Checkpoint 3); LZ77 compression (Checkpoint 4); AES-128 (Checkpoint 5); RSA key exchange (Checkpoint 6); packetization (Checkpoint 7).
 
 ## 1. The finite field GF(2^8)
 
@@ -389,3 +389,113 @@ Modular exponentiation never uses Python's built-in three-argument `pow` (an AST
 
 Measured with the running code: a 160-bit key pair is generated in about a millisecond and a 512-bit key pair in about 0.04 s
 (including the HTTP round trip and a 54 KB response).
+
+
+---
+
+## 9. Packetization (Stage 6)
+
+**Purpose.** A byte string (in the full pipeline: the AES ciphertext) is cut into fixed-size chunks. Each chunk travels in a
+packet that also carries what the receiver needs to rebuild the message even when packets arrive late, out of order, twice, or
+not at all.
+
+### Wire format (big-endian; 14-byte header, then the payload)
+
+| offset | size | field | meaning |
+|-------:|-----:|-------|---------|
+| 0 | 1 | `version` | always 1 |
+| 1 | 1 | `flags` | reserved, must be 0 |
+| 2 | 4 | `sequence` | 0-based packet index (0 .. total-1) |
+| 6 | 4 | `total` | number of packets in the message (>= 1) |
+| 10 | 2 | `payload_length` | payload bytes that follow (0 .. 65535) |
+| 12 | 2 | `header_checksum` | 16-bit Internet checksum of the 14 header bytes |
+| 14 | n | payload | the chunk |
+
+`serialized_size = 14 + payload_length` is **not** the payload size; the difference is protocol overhead.
+`payload_size` (an argument) is the maximum payload per packet.
+
+### Chunking arithmetic and overhead
+
+For `n` data bytes and payload size `s`: `packet_count = ceil(n / s)` packets, all full except possibly the last (never an empty trailing
+packet). An **empty message is one packet with an empty payload and `total = 1`**, not zero packets, so a receiver can tell
+"the message is empty" from "nothing arrived".
+
+Overhead per packet is the fixed 14 bytes, so efficiency is `s / (s + 14)` for full packets. Measured with the running code for a
+1000-byte message:
+
+| payload size | packets | serialized bytes | overhead | efficiency |
+|-------------:|--------:|-----------------:|---------:|-----------:|
+| 8 | 125 | 2750 | 63.64 % | 36.36 % |
+| 16 | 63 | 1882 | 46.87 % | 53.13 % |
+| 32 | 32 | 1448 | 30.94 % | 69.06 % |
+| 64 | 16 | 1224 | 18.30 % | 81.70 % |
+| 128 | 8 | 1112 | 10.07 % | 89.93 % |
+| 256 | 4 | 1056 | 5.30 % | 94.70 % |
+| 512 | 2 | 1028 | 2.72 % | 97.28 % |
+| 1000 | 1 | 1014 | 1.38 % | 98.62 % |
+
+Small payloads waste most of each packet on headers; very large payloads reduce overhead but lose more data per lost packet. That
+trade-off is the reason for the `payload_size` slider in the experiments.
+
+### The header integrity field: the Internet checksum (RFC 1071)
+
+Treat the data as 16-bit big-endian words (append a zero byte if the length is odd), add them with **end-around carry** (any carry out of
+bit 16 is added back in; this is one's-complement addition), and take the one's complement of the result. The checksum field is 0 while it
+is computed. A receiver sums **all** header words including the stored checksum: the result is `0xFFFF`, so the checksum of the whole header
+is 0.
+
+Worked example, packet 0 of the 37-byte message with payload size 10 (header words `0100 0000 0000 0000 0004 000a`, checksum field
+`0000`): the sum is `0x0100 + 0x0004 + 0x000a = 0x010e`, and the checksum is `~0x010e = 0xfef1`. The full table (produced by the code):
+
+| sequence | total | payload length | header (hex) | checksum |
+|---------:|------:|---------------:|--------------|----------|
+| 0 | 4 | 10 | `01000000000000000004000afef1` | `0xfef1` |
+| 1 | 4 | 10 | `01000000000100000004000afef0` | `0xfef0` |
+| 2 | 4 | 10 | `01000000000200000004000afeef` | `0xfeef` |
+| 3 | 4 | 7 | `010000000003000000040007fef1` | `0xfef1` |
+
+Verification: RFC 1071's example (`0001 f203 f4f5 f6f7` gives `0x220d`) and the well-known IPv4 header example (checksum `0xb861`) both pass, and
+the implementation is cross-checked against an independent big-integer implementation on 2000 random inputs.
+
+**What it detects.** Every single-bit error: all 112 header bits of four different packets are flipped one at a time and every flip is detected
+(either by the parser or by the checksum).
+
+**What it cannot detect (each demonstrated by a test, using the code's own packets).**
+* **Reordered words.** Addition is commutative. Swapping the low words of `sequence` and `total` turns packet `3/5` into `5/3` and the header still
+  verifies (`header_ok() = True`). Reassembly's *consistency* checks then catch it, not the checksum.
+* **Cancelling errors.** Adding 1 to one word and subtracting 1 from another leaves the sum unchanged: packet `3/5` becomes `4/4` and still verifies
+  (`header_ok() = True`).
+* **Payload damage.** The checksum covers the header only. Replacing `ORIGINAL` with `TAMPERED` leaves a valid header (`header_ok() = True`) and
+  reassembly returns the tampered bytes. Payload integrity is the job of the **CRC-32 stage that follows**; a CRC, unlike this sum, detects reordering
+  and burst errors. The checksum therefore protects the *framing*, and the CRC will protect the *content*.
+
+### Reassembly rules
+
+Packets may arrive in any order; reassembly sorts by sequence number. It checks, in this **priority order** (a corrupt header makes every other
+field untrustworthy):
+
+| priority | condition | error kind |
+|---------:|-----------|------------|
+| 1 | no packets at all | `no_packets` |
+| 2 | any header checksum failure | `header_checksum` |
+| 3 | packets disagree about `total` | `inconsistent_total` |
+| 4 | a sequence number outside `0 .. total-1` | `invalid_sequence` |
+| 5 | the same sequence twice (identical copies can be tolerated; conflicting copies never) | `duplicate` |
+| 6 | some sequence numbers never arrived | `missing` |
+
+The non-raising diagnosis (`inspect_packets`) discards packets that fail their checksum before computing totals, duplicates and missing numbers: a
+corrupted packet cannot be trusted to fill a slot, and its damaged fields must not create a bogus duplicate (for example a flipped sequence number
+colliding with a genuine packet) or hide a missing one.
+
+**Resource safety.** A forged header may claim `total = 4,294,967,295`. Missing and invalid-sequence lists in results are capped at 1,000 entries while
+the exact count is always reported, so reassembly never builds a list that large (a test uses exactly this forged header).
+
+### Experiments
+
+The API can perturb the packet set before reassembly, in a fixed, reproducible order: **corrupt headers** (flip one sequence-number bit, keep the old
+checksum) → **duplicate** → **drop** (explicit sequences, then random loss) → **shuffle**. Random loss removes each packet independently with
+probability `p` using `random.Random(seed)` (one draw per packet, in list order); shuffling uses `random.Random(seed).shuffle`. The expected number of
+lost packets is `p * packet_count`, but an individual run, like the channel BER later, does not have to match it exactly.
+
+Measured: a 40,000-byte message split into 40,000 one-byte packets with 20 % loss was packetized, perturbed, diagnosed and reassembled in under 0.7 s
+over HTTP (31,850 packets received, 8,150 reported missing).

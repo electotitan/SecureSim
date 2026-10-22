@@ -30,7 +30,7 @@ Tracebacks and the submitted input values are never included in error responses.
 
 ## GET `/api/health`
 
-`{"status": "ok", "app": "...", "version": "0.6.0"}`
+`{"status": "ok", "app": "...", "version": "0.7.0"}`
 
 ## POST `/api/encode/huffman`
 
@@ -203,3 +203,57 @@ returned because showing them is the purpose of the demonstration; use disposabl
 `invalid_key_parameter` from request-model codes such as `string_too_long` or `value_error`): `p`/`q` not prime or not odd, `p == q`,
 `e` not coprime to phi or not smaller than phi, a message not smaller than `n`, a modulus too small to carry a 128-bit key (the key is
 never truncated), odd or out-of-range `modulus_bits`, `p` without `q`, conflicting fields.
+
+
+## POST `/api/packetize`
+
+Splits data into packets (format and rules: `MATHEMATICAL_FOUNDATIONS.md` section 9), optionally perturbs the packet set, then runs the receiver:
+diagnosis and reassembly.
+
+| field | type | default | notes |
+|-------|------|---------|-------|
+| `text` / `data_hex` | string | | exactly one required; at most 40,000 bytes |
+| `payload_size` | integer 1..4096 | 64 | maximum payload bytes per packet |
+| `loss_probability` | number 0..1 | 0 | each packet is lost independently; integers 0 and 1 accepted, strings and booleans rejected |
+| `seed` | integer 0..2^32-1 | none | makes random loss and shuffling reproducible |
+| `drop_sequences` | list of integers | [] | original sequence numbers to lose (all copies); at most 1000 entries |
+| `duplicate_sequences` | list of integers | [] | sequences to send twice |
+| `corrupt_header_sequences` | list of integers | [] | flip bit 0 of the sequence field but keep the old checksum |
+| `shuffle` | boolean | false | random arrival order |
+| `allow_identical_duplicates` | boolean | false | tolerate repeated packets whose payload equals the first copy |
+
+Sequence numbers in the three lists must exist (`0 .. packet_count-1`, HTTP 422 with `code: sequence_out_of_range` otherwise). Experiment order:
+corrupt, duplicate, drop (explicit, then random), shuffle.
+
+Response (abridged; values from a real run on the 37-byte message with `payload_size` 10):
+
+```json
+{
+  "data_bytes": 37, "payload_size": 10, "header_size": 14,
+  "stats": {"packet_count": 4, "payload_bytes": 37, "header_bytes_total": 56, "serialized_bytes_total": 93,
+            "overhead_percent": 60.215, "efficiency_percent": 39.785, "largest_payload": 10, "last_payload": 7, "header_size": 14},
+  "packets": [{"position": 0, "sequence": 0, "total": 4, "payload_length": 10, "serialized_size": 24,
+               "header_hex": "01000000000000000004000afef1", "checksum": 65265, "checksum_hex": "0xfef1",
+               "checksum_valid": true, "status": "ok", "payload_hex": "68656c6c6f207061636b", "payload_truncated": false}, "..."],
+  "packets_returned": 4, "packets_truncated": false,
+  "lossless_round_trip_ok": true,
+  "experiment": {"applied": false, "sent_count": 4, "received_count": 4, "...": "..."},
+  "received_packets": ["... same record shape, in ARRIVAL order ..."], "received_truncated": false,
+  "diagnosis": {"status": "complete", "complete": true, "missing": [], "duplicate_sequences": [], "corrupted_positions": [], "...": "..."},
+  "reassembly": {"success": true, "error_kind": null, "message": null, "details": {}, "recovered_bytes": 37, "recovered_matches_original": true},
+  "header_checksum_note": "..."
+}
+```
+
+Notes:
+* `stats` describe the packets **sent**; `received_packets`/`diagnosis`/`reassembly` describe what **arrived**.
+* Per-packet `status`: `ok`, `corrupted_header`, or `duplicate` (a later copy of an already-seen valid sequence).
+* At most 256 packet records per table and 128 payload bytes per record are returned (`packets_truncated`, `received_truncated`, `payload_truncated`);
+  statistics, diagnosis and the round trip always cover every packet.
+* `lossless_round_trip_ok` is computed: the untouched packets are reassembled and compared with the input byte for byte. A failure of that
+  self-check is reported as `false`, never as an HTTP error.
+* `reassembly.error_kind` is one of `no_packets`, `header_checksum`, `inconsistent_total`, `invalid_sequence`, `duplicate`, `missing` (priority order in the
+  foundations document). A failed reassembly is a normal 200 response, not an error: it is the experiment's result. `details` carries bounded lists plus exact
+  counts (`missing`, `missing_count`, `missing_truncated`, ...).
+* `diagnosis` ignores packets that fail their header checksum when computing totals, duplicates and missing sequences (they are listed under `corrupted_*`).
+* `recovered_matches_original` compares the recovered bytes with the input byte for byte; success without a match would be reported as `false`.
