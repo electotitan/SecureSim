@@ -1539,3 +1539,400 @@ def test_rsa_api_limits_accept_exactly_the_maximum_digits_at_the_model_layer():
     assert err["details"][0]["code"] == "invalid_key_parameter"
     err = assert_error(rsa_post(mode="integer", p="61", q="53", e="17", message="9" * 160), 422)
     assert err["details"][0]["code"] == "message_too_large"
+
+
+# ====================================================================== Checkpoint 7: packetization endpoint
+from backend.models import MAX_PACKETS_RETURNED, MAX_PAYLOAD_PREVIEW_BYTES
+from backend.pipeline import packetization as _pk
+
+PKT = "/api/packetize"
+
+
+def pk_post(**body):
+    return client.post(PKT, json=body)
+
+
+MSG = "hello packet world, this is a message"        # 37 bytes -> 4 packets of 10
+
+
+# ------------------------------------------------------------------ the packet table
+def test_packetize_hand_derived_header_for_a_tiny_message():
+    d = pk_post(text="AB").json()
+    p = d["packets"][0]
+    # header words 0100 0000 0000 0000 0001 0002 [0000]: sum 0103 -> checksum fefc (derived by hand)
+    assert p["header_hex"] == "0100" "00000000" "00000001" "0002" "fefc"
+    assert (p["sequence"], p["total"], p["payload_length"], p["serialized_size"]) == (0, 1, 2, 16)
+    assert (p["checksum"], p["checksum_hex"], p["checksum_valid"], p["status"]) == (0xFEFC, "0xfefc", True, "ok")
+    assert p["payload_hex"] == "4142" and p["payload_truncated"] is False and p["position"] == 0
+
+
+def test_packetize_table_for_a_multi_packet_message():
+    d = pk_post(text=MSG, payload_size=10).json()
+    assert d["data_bytes"] == 37 and d["payload_size"] == 10 and d["header_size"] == 14
+    assert [(p["sequence"], p["total"], p["payload_length"], p["serialized_size"]) for p in d["packets"]] == [
+        (0, 4, 10, 24), (1, 4, 10, 24), (2, 4, 10, 24), (3, 4, 7, 21)]
+    assert all(p["checksum_valid"] and p["status"] == "ok" for p in d["packets"])
+    assert b"".join(bytes.fromhex(p["payload_hex"]) for p in d["packets"]) == MSG.encode()
+    assert d["packets_returned"] == 4 and d["packets_truncated"] is False
+    assert d["lossless_round_trip_ok"] is True and "RFC 1071" in d["header_checksum_note"]
+
+
+def test_packetize_matches_the_library_exactly():
+    data = bytes(range(200))
+    d = pk_post(data_hex=data.hex(), payload_size=33).json()
+    lib = _pk.create_packets(data, 33)
+    assert [p["header_hex"] for p in d["packets"]] == [q.header_bytes().hex() for q in lib]
+    assert [p["checksum"] for p in d["packets"]] == [q.checksum for q in lib]
+
+
+def test_packetize_default_payload_size_is_64():
+    d = pk_post(data_hex="aa" * 130).json()
+    assert d["payload_size"] == 64 and [p["payload_length"] for p in d["packets"]] == [64, 64, 2]
+
+
+def test_packetize_stats_separate_payload_from_serialized_size():
+    s = pk_post(data_hex="aa" * 130).json()["stats"]
+    assert (s["packet_count"], s["payload_bytes"], s["header_bytes_total"], s["serialized_bytes_total"]) == (3, 130, 42, 172)
+    assert s["overhead_percent"] == pytest.approx(42 / 172 * 100) and s["efficiency_percent"] == pytest.approx(130 / 172 * 100)
+    assert (s["header_size"], s["largest_payload"], s["last_payload"]) == (14, 64, 2)
+
+
+def test_packetize_empty_message_is_one_empty_packet():
+    for body in ({"text": ""}, {"data_hex": ""}):
+        d = pk_post(**body).json()
+        assert d["data_bytes"] == 0 and d["stats"]["packet_count"] == 1
+        p = d["packets"][0]
+        assert (p["sequence"], p["total"], p["payload_length"], p["payload_hex"], p["serialized_size"]) == (0, 1, 0, "", 14)
+        assert d["lossless_round_trip_ok"] is True and d["reassembly"]["success"] is True
+        assert d["reassembly"]["recovered_bytes"] == 0 and d["reassembly"]["recovered_matches_original"] is True
+
+
+def test_packetize_unicode_is_packetized_by_utf8_bytes():
+    d = pk_post(text="é😀", payload_size=4).json()
+    assert d["data_bytes"] == 6 and [p["payload_length"] for p in d["packets"]] == [4, 2]
+
+
+def test_packetize_table_is_bounded_but_statistics_and_round_trip_cover_everything():
+    d = pk_post(data_hex="ab" * 40_000, payload_size=1).json()
+    assert d["stats"]["packet_count"] == 40_000 and d["stats"]["payload_bytes"] == 40_000
+    assert d["packets_returned"] == len(d["packets"]) == MAX_PACKETS_RETURNED == 256 and d["packets_truncated"] is True
+    assert d["lossless_round_trip_ok"] is True and d["packets"][-1]["sequence"] == 255
+    assert d["reassembly"]["success"] is True and d["reassembly"]["recovered_matches_original"] is True
+
+
+def test_packetize_payload_preview_is_bounded_per_packet():
+    d = pk_post(data_hex="cd" * 4096, payload_size=4096).json()
+    p = d["packets"][0]
+    assert p["payload_length"] == 4096 and p["payload_truncated"] is True
+    assert len(p["payload_hex"]) == 2 * MAX_PAYLOAD_PREVIEW_BYTES == 256
+    assert p["serialized_size"] == 14 + 4096
+
+
+def test_packetize_no_experiment_means_received_equals_sent():
+    d = pk_post(text=MSG, payload_size=10).json()
+    assert d["experiment"]["applied"] is False and d["experiment"]["sent_count"] == d["experiment"]["received_count"] == 4
+    assert d["received_packets"] == d["packets"]
+    assert d["diagnosis"]["status"] == "complete" and d["diagnosis"]["complete"] is True
+
+
+def test_packetize_is_deterministic():
+    body = dict(text=MSG, payload_size=7, loss_probability=0.4, seed=5, shuffle=True)
+    assert pk_post(**body).json() == pk_post(**body).json()
+
+
+# ------------------------------------------------------------------ experiments: loss
+def test_packetize_explicit_drops_are_reported_as_missing():
+    d = pk_post(text=MSG, payload_size=10, drop_sequences=[1, 3]).json()
+    r = d["reassembly"]
+    assert r["success"] is False and r["error_kind"] == "missing"
+    assert r["details"]["missing"] == [1, 3] and r["details"]["missing_count"] == 2 and r["details"]["expected_total"] == 4
+    assert r["recovered_bytes"] is None and r["recovered_matches_original"] is None and "missing" in r["message"]
+    assert d["diagnosis"]["status"] == "missing" and d["diagnosis"]["missing"] == [1, 3]
+    assert d["experiment"]["dropped_sequences_explicit"] == [1, 3] and d["experiment"]["received_count"] == 2
+    assert d["experiment"]["applied"] is True and [p["sequence"] for p in d["received_packets"]] == [0, 2]
+    assert d["lossless_round_trip_ok"] is True                              # the original packets themselves were fine
+
+
+def test_packetize_losing_the_last_packet_is_detected():
+    d = pk_post(text=MSG, payload_size=10, drop_sequences=[3]).json()
+    assert d["reassembly"]["error_kind"] == "missing" and d["reassembly"]["details"]["missing"] == [3]
+
+
+def test_packetize_random_loss_matches_the_documented_seeded_contract():
+    p, seed = 0.5, 9
+    rng = _random.Random(seed)
+    expected_lost = [i for i in range(20) if rng.random() < p]
+    d = pk_post(data_hex="ab" * 200, payload_size=10, loss_probability=p, seed=seed).json()
+    assert d["experiment"]["dropped_sequences_random"] == expected_lost and expected_lost
+    assert d["experiment"]["received_count"] == 20 - len(expected_lost)
+    assert d["reassembly"]["details"]["missing"] == expected_lost
+
+
+def test_packetize_loss_probability_extremes():
+    d = pk_post(text=MSG, payload_size=10, loss_probability=1).json()          # integer 1 is accepted
+    assert d["reassembly"]["error_kind"] == "no_packets" and d["experiment"]["received_count"] == 0
+    assert d["diagnosis"]["status"] == "no_packets" and d["received_packets"] == []
+    d = pk_post(text=MSG, payload_size=10, loss_probability=0, seed=1).json()
+    assert d["reassembly"]["success"] is True and d["experiment"]["applied"] is False
+
+
+def test_packetize_random_loss_is_reproducible_and_seed_dependent():
+    a = pk_post(data_hex="ab" * 500, payload_size=10, loss_probability=0.3, seed=1).json()
+    b = pk_post(data_hex="ab" * 500, payload_size=10, loss_probability=0.3, seed=1).json()
+    c = pk_post(data_hex="ab" * 500, payload_size=10, loss_probability=0.3, seed=2).json()
+    assert a == b and a["experiment"]["dropped_sequences_random"] != c["experiment"]["dropped_sequences_random"]
+
+
+def test_packetize_loss_rate_is_statistically_plausible():
+    d = pk_post(data_hex="ab" * 2000, payload_size=1, loss_probability=0.25, seed=3).json()
+    lost = len(d["experiment"]["dropped_sequences_random"])
+    assert abs(lost / 2000 - 0.25) < 0.04
+
+
+# ------------------------------------------------------------------ experiments: duplicates, corruption, order
+def test_packetize_duplicates_are_detected_and_labelled():
+    d = pk_post(text=MSG, payload_size=10, duplicate_sequences=[2]).json()
+    r = d["reassembly"]
+    assert r["error_kind"] == "duplicate" and r["details"]["duplicate_sequences"] == [2] and r["details"]["conflicting"] is False
+    assert [(p["sequence"], p["status"]) for p in d["received_packets"]] == [(0, "ok"), (1, "ok"), (2, "ok"), (2, "duplicate"), (3, "ok")]
+    assert d["experiment"]["duplicated_sequences"] == [2] and d["experiment"]["received_count"] == 5
+    assert d["diagnosis"]["status"] == "duplicate" and d["diagnosis"]["duplicate_sequences"] == [2]
+
+
+def test_packetize_identical_duplicates_can_be_tolerated():
+    d = pk_post(text=MSG, payload_size=10, duplicate_sequences=[0, 2], allow_identical_duplicates=True).json()
+    assert d["reassembly"]["success"] is True and d["reassembly"]["recovered_matches_original"] is True
+    assert d["diagnosis"]["status"] == "complete"
+    assert [p["status"] for p in d["received_packets"]].count("duplicate") == 2      # still labelled in the table
+
+
+def test_packetize_corrupted_header_is_detected_and_the_packet_discarded():
+    d = pk_post(text=MSG, payload_size=10, corrupt_header_sequences=[0]).json()
+    r = d["reassembly"]
+    assert r["error_kind"] == "header_checksum" and r["details"]["corrupted_positions"] == [0]
+    bad = d["received_packets"][0]
+    assert bad["status"] == "corrupted_header" and bad["checksum_valid"] is False
+    assert bad["sequence"] == 1 and bad["checksum"] == d["packets"][0]["checksum"]      # sequence bit flipped, checksum kept
+    assert d["diagnosis"]["corrupted_count"] == 1 and d["diagnosis"]["missing"] == [0]  # discarded: slot 0 is missing
+    assert d["diagnosis"]["duplicate_sequences"] == []                                  # no bogus duplicate of packet 1
+    assert d["experiment"]["corrupted_header_sequences"] == [0]
+    statuses = [p["status"] for p in d["received_packets"]]
+    assert statuses == ["corrupted_header", "ok", "ok", "ok"]
+
+
+def test_packetize_shuffling_does_not_break_reassembly():
+    d = pk_post(data_hex=bytes(range(100)).hex(), payload_size=10, shuffle=True, seed=4).json()
+    seqs = [p["sequence"] for p in d["received_packets"]]
+    assert seqs != list(range(10)) and sorted(seqs) == list(range(10))
+    assert d["reassembly"]["success"] is True and d["reassembly"]["recovered_matches_original"] is True
+    assert d["experiment"]["shuffled"] is True and d["experiment"]["applied"] is True
+
+
+def test_packetize_shuffle_follows_the_documented_seeded_contract():
+    items = list(range(10))
+    _random.Random(4).shuffle(items)
+    d = pk_post(data_hex=bytes(range(100)).hex(), payload_size=10, shuffle=True, seed=4).json()
+    assert [p["sequence"] for p in d["received_packets"]] == items
+
+
+def test_packetize_combined_experiment_reports_the_highest_priority_problem_and_every_fact():
+    d = pk_post(text=MSG, payload_size=10, drop_sequences=[1], corrupt_header_sequences=[2],
+                duplicate_sequences=[0]).json()
+    assert d["reassembly"]["error_kind"] == "header_checksum"                       # priority over missing / duplicate
+    dg = d["diagnosis"]
+    assert dg["corrupted_count"] == 1 and dg["duplicate_sequences"] == [0] and dg["missing"] == [1, 2]
+    assert dg["status"] == "header_checksum"
+
+
+def test_packetize_explicit_drop_removes_every_copy_of_a_duplicated_packet():
+    d = pk_post(text=MSG, payload_size=10, duplicate_sequences=[1], drop_sequences=[1]).json()
+    assert d["reassembly"]["error_kind"] == "missing" and d["reassembly"]["details"]["missing"] == [1]
+    assert d["experiment"]["received_count"] == 3
+
+
+def test_packetize_experiment_flags_and_lists_are_normalised():
+    d = pk_post(text=MSG, payload_size=10, drop_sequences=[3, 1, 1], duplicate_sequences=[2, 2, 0]).json()
+    assert d["experiment"]["dropped_sequences_explicit"] == [1, 3] and d["experiment"]["duplicated_sequences"] == [0, 2]
+
+
+# ------------------------------------------------------------------ validation
+@pytest.mark.parametrize("name", ["drop_sequences", "duplicate_sequences", "corrupt_header_sequences"])
+def test_packetize_sequence_numbers_must_exist(name):
+    err = assert_error(pk_post(text=MSG, payload_size=10, **{name: [4]}), 422)
+    assert err["details"][0]["field"] == f"body.{name}" and err["details"][0]["code"] == "sequence_out_of_range"
+    assert "numbered 0..3" in err["message"] and "sequence 4 does not exist" in err["message"]
+    assert pk_post(text=MSG, payload_size=10, **{name: [3]}).status_code == 200          # last valid sequence
+    assert_error(pk_post(text="", **{name: [1]}), 422)                                    # the empty message has only packet 0
+    assert pk_post(text="", **{name: [0]}).status_code == 200
+
+
+@pytest.mark.parametrize("name", ["drop_sequences", "duplicate_sequences", "corrupt_header_sequences"])
+@pytest.mark.parametrize("bad, code", [([-1], "greater_than_equal"), ([1.5], "int_type"), ([True], "int_type"),
+                                       (["3"], "int_type"), ([None], "int_type"), ("3", "list_type"), (3, "list_type")])
+def test_packetize_sequence_lists_are_strictly_typed(name, bad, code):
+    err = assert_error(pk_post(text="abc", **{name: bad}), 422)
+    assert err["details"][0]["field"].startswith(f"body.{name}") and err["details"][0]["code"] == code
+
+
+def test_packetize_sequence_lists_are_bounded():
+    assert pk_post(text="abc", drop_sequences=[0] * 1000).status_code == 200
+    err = assert_error(pk_post(text="abc", drop_sequences=[0] * 1001), 422)
+    assert err["details"][0]["field"] == "body.drop_sequences" and err["details"][0]["code"] == "too_long"
+
+
+@pytest.mark.parametrize("bad, code", [(0, "greater_than_equal"), (-5, "greater_than_equal"), (4097, "less_than_equal"),
+                                       (10 ** 9, "less_than_equal"), (64.0, "int_type"), ("64", "int_type"),
+                                       (True, "int_type"), (None, "int_type")])
+def test_packetize_payload_size_validation(bad, code):
+    err = assert_error(pk_post(text="abc", payload_size=bad), 422)
+    assert err["details"][0]["field"] == "body.payload_size" and err["details"][0]["code"] == code
+
+
+def test_packetize_payload_size_boundaries_accepted():
+    assert pk_post(text="abc", payload_size=1).json()["stats"]["packet_count"] == 3
+    assert pk_post(text="abc", payload_size=4096).json()["stats"]["packet_count"] == 1
+
+
+@pytest.mark.parametrize("bad, code", [(-0.1, "greater_than_equal"), (1.1, "less_than_equal"), (2, "less_than_equal"),
+                                       ("0.5", "float_type"), (True, "float_type"), (None, "float_type"),
+                                       ([0.5], "float_type")])
+def test_packetize_loss_probability_validation(bad, code):
+    err = assert_error(pk_post(text="abc", loss_probability=bad), 422)
+    assert err["details"][0]["field"] == "body.loss_probability" and err["details"][0]["code"] == code
+
+
+@pytest.mark.parametrize("body, field", [
+    ({"seed": -1}, "body.seed"), ({"seed": 2 ** 32}, "body.seed"), ({"seed": 1.5}, "body.seed"),
+    ({"seed": True}, "body.seed"), ({"seed": "7"}, "body.seed"),
+    ({"shuffle": "yes"}, "body.shuffle"), ({"shuffle": 1}, "body.shuffle"), ({"shuffle": None}, "body.shuffle"),
+    ({"allow_identical_duplicates": "no"}, "body.allow_identical_duplicates"),
+    ({"allow_identical_duplicates": 0}, "body.allow_identical_duplicates"),
+    ({"data_hex": "abc"}, "body.data_hex"), ({"data_hex": "zz"}, "body.data_hex"), ({"data_hex": "61  "}, "body.data_hex"),
+    ({"text": 123}, "body.text"), ({"text": ["a"]}, "body.text"),
+])
+def test_packetize_validation_errors_name_the_field(body, field):
+    body = {"text": "abc", **body} if "data_hex" not in body and "text" not in body else body
+    err = assert_error(pk_post(**body), 422)
+    assert err["details"][0]["field"] == field
+
+
+@pytest.mark.parametrize("body", [{}, {"text": "a", "data_hex": "61"}, {"text": None, "data_hex": None}])
+def test_packetize_exactly_one_input(body):
+    err = assert_error(pk_post(**body), 422)
+    assert err["details"][0]["field"] == "body" and "exactly one" in err["details"][0]["message"]
+
+
+def test_packetize_size_limits_extras_and_methods():
+    assert pk_post(data_hex="ab" * 40_000, payload_size=4096).status_code == 200
+    err = assert_error(pk_post(data_hex="ab" * 40_001), 422)
+    assert err["details"][0]["field"] == "body.data_hex"
+    assert_error(pk_post(text="a" * (MAX_TEXT_CHARS + 1)), 422)
+    assert_error(pk_post(text="a", bogus=1), 422)
+    assert_error(client.post(PKT, content="{nope", headers={"content-type": "application/json"}), 422)
+    assert_error(client.post(PKT, content='{"text": "x \\ud800"}', headers={"content-type": "application/json"}), 422)
+    big = json.dumps({"text": "a" * (MAX_BODY_BYTES + 10)})
+    assert_error(client.post(PKT, content=big, headers={"content-type": "application/json"}), 413)
+    assert_error(client.get(PKT), 405, "http_error")
+
+
+def test_packetize_errors_do_not_echo_the_data():
+    r = pk_post(text="TOP-SECRET-PAYLOAD", payload_size=0)
+    assert r.status_code == 422 and "TOP-SECRET-PAYLOAD" not in r.text
+
+
+# ------------------------------------------------------------------ honesty of computed fields
+def test_packetize_lossless_flag_is_computed_not_hardcoded(monkeypatch):
+    import backend.main as m
+    monkeypatch.setattr(m.packetization, "reassemble_packets", lambda *a, **k: b"WRONG")
+    d = pk_post(text=MSG, payload_size=10).json()
+    assert d["lossless_round_trip_ok"] is False
+    assert d["reassembly"]["success"] is True and d["reassembly"]["recovered_matches_original"] is False
+
+
+def test_packetize_internal_inconsistency_is_a_flag_not_a_server_error(monkeypatch):
+    import backend.main as m
+
+    def boom(*a, **k):
+        raise _pk.MissingPacketsError("simulated", missing=[0], missing_count=1, missing_truncated=False,
+                                      expected_total=1, received_unique=0)
+
+    monkeypatch.setattr(m.packetization, "reassemble_packets", boom)
+    r = pk_post(text=MSG, payload_size=10)
+    assert r.status_code == 200 and r.json()["lossless_round_trip_ok"] is False
+    assert r.json()["reassembly"]["error_kind"] == "missing"
+
+
+def test_packetize_checksum_validity_is_computed_from_the_header(monkeypatch):
+    monkeypatch.setattr(_pk.Packet, "header_ok", lambda self: False)
+    d = pk_post(text=MSG, payload_size=10).json()
+    assert all(p["checksum_valid"] is False and p["status"] == "corrupted_header" for p in d["packets"])
+    assert d["lossless_round_trip_ok"] is False and d["diagnosis"]["status"] == "header_checksum"
+
+
+def test_packetize_unexpected_crash_is_a_clean_500(monkeypatch):
+    import backend.main as m
+
+    def crash(*a, **k):
+        raise RuntimeError("secret internal detail /srv/pk.py")
+
+    monkeypatch.setattr(m.packetization, "create_packets", lambda *a, **k: crash())
+    r = TestClient(app, raise_server_exceptions=False).post(PKT, json={"text": "abc"})
+    err = assert_error(r, 500, "internal_error")
+    assert "secret" not in r.text and err["message"] == "Internal server error."
+
+
+def test_packetize_listed_in_openapi():
+    assert "post" in client.get("/openapi.json").json()["paths"][PKT]
+
+
+# ------------------------------------------------------------------ gap-closing tests (found by mutation testing)
+def test_packetize_explicit_drop_removes_a_packet_even_if_it_was_also_corrupted():
+    d = pk_post(text=MSG, payload_size=10, corrupt_header_sequences=[1], drop_sequences=[1]).json()
+    assert d["experiment"]["received_count"] == 3 and [p["sequence"] for p in d["received_packets"]] == [0, 2, 3]
+    assert all(p["status"] == "ok" for p in d["received_packets"])
+    assert d["reassembly"]["error_kind"] == "missing" and d["reassembly"]["details"]["missing"] == [1]
+    assert d["diagnosis"]["corrupted_count"] == 0
+
+
+def test_packetize_random_loss_is_reported_by_sequence_not_by_list_position():
+    # explicit drops of 0 and 1 and a duplicated packet shift list positions away from sequence numbers
+    seed, p = 3, 0.5
+    sent = [(0, 'a'), (1, 'a'), (2, 'x'), (2, 'x'), (3, 'x'), (4, 'x'), (5, 'x'), (6, 'x'), (7, 'x'), (8, 'x'), (9, 'x')]
+    items = [orig for orig, _ in sent if orig not in (0, 1)]                  # after duplicate of 2 and drops of 0, 1
+    rng = _random.Random(seed)
+    lost_positions = [i for i in range(len(items)) if rng.random() < p]
+    expected = sorted({items[i] for i in lost_positions})
+    d = pk_post(data_hex=bytes(range(100)).hex(), payload_size=10, drop_sequences=[0, 1], duplicate_sequences=[2],
+                loss_probability=p, seed=seed).json()
+    assert d["experiment"]["dropped_sequences_random"] == expected and expected
+    assert d["experiment"]["dropped_sequences_explicit"] == [0, 1]
+    assert d["experiment"]["received_count"] == len(items) - len(lost_positions)
+    assert set(expected).isdisjoint({0, 1}) and max(expected) > 3             # sequences, not 0-based list positions
+
+
+def test_packetize_experiment_applied_flag_for_each_trigger_alone():
+    assert pk_post(text=MSG, payload_size=10).json()["experiment"]["applied"] is False
+    assert pk_post(text=MSG, payload_size=10, loss_probability=0, shuffle=False, seed=1).json()["experiment"]["applied"] is False
+    for extra in ({"loss_probability": 0.2, "seed": 1}, {"loss_probability": 1e-9, "seed": 1}, {"corrupt_header_sequences": [0]},
+                  {"duplicate_sequences": [1]}, {"drop_sequences": [2]}, {"shuffle": True, "seed": 1}):
+        assert pk_post(text=MSG, payload_size=10, **extra).json()["experiment"]["applied"] is True, extra
+
+
+def test_packetize_stats_describe_the_packets_sent_not_the_packets_received():
+    d = pk_post(data_hex="aa" * 130, payload_size=64, drop_sequences=[0], duplicate_sequences=[2]).json()
+    s = d["stats"]
+    assert s["packet_count"] == 3 and s["payload_bytes"] == 130 and s["serialized_bytes_total"] == 172
+    # sent 0, 1, 2; packet 0 dropped, packet 2 duplicated -> received sequences 1, 2, 2 (three packets, not the same three)
+    assert d["experiment"]["sent_count"] == 3 and d["experiment"]["received_count"] == 3
+    assert [x["sequence"] for x in d["received_packets"]] == [1, 2, 2] and [x["sequence"] for x in d["packets"]] == [0, 1, 2]
+
+
+def test_packetize_received_table_is_bounded_independently_of_the_sent_table():
+    d = pk_post(data_hex="ab" * 3000, payload_size=1, loss_probability=0.1, seed=2).json()
+    assert d["packets_truncated"] is True and d["received_truncated"] is True
+    assert len(d["received_packets"]) == MAX_PACKETS_RETURNED and d["experiment"]["received_count"] > MAX_PACKETS_RETURNED
+    small = pk_post(data_hex="ab" * 100, payload_size=1, loss_probability=0.5, seed=2).json()       # 100 sent, ~50 received
+    assert small["packets_truncated"] is False and small["received_truncated"] is False
+    just = pk_post(data_hex="ab" * 300, payload_size=1, drop_sequences=list(range(100))).json()      # 300 sent, 200 received
+    assert just["packets_truncated"] is True and just["received_truncated"] is False
+    assert len(just["received_packets"]) == 200

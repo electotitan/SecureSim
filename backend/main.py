@@ -14,6 +14,7 @@ Stage endpoints are added checkpoint by checkpoint:
   * POST /api/encrypt/aes     (Checkpoint 5)
   * POST /api/decrypt/aes     (Checkpoint 5)
   * POST /api/encrypt/rsa-keyexchange (Checkpoint 6)
+  * POST /api/packetize        (Checkpoint 7)
 """
 from __future__ import annotations
 
@@ -29,18 +30,18 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from backend.errors import IntegrityFailure, ValidationFailure, error_body, register_error_handlers
 from backend.models import (
     DEFAULT_RSA_INTEGER_BITS, DEFAULT_RSA_WRAP_BITS, MAX_AES_BLOCKS_RETURNED, MAX_BODY_BYTES,
-    MAX_RSA_PRIME_BITS, MAX_RSA_STEPS_RETURNED, MAX_TOKENS_RETURNED, MIN_RSA_WRAP_BITS,
-    AESDecryptRequest, AESDecryptResponse, AESEncryptRequest, AESEncryptResponse, BinaryRequest,
+    MAX_PACKETS_RETURNED, MAX_PAYLOAD_PREVIEW_BYTES, MAX_RSA_PRIME_BITS, MAX_RSA_STEPS_RETURNED,
+    MAX_TOKENS_RETURNED, MIN_RSA_WRAP_BITS, PacketizeRequest, PacketizeResponse, AESDecryptRequest, AESDecryptResponse, AESEncryptRequest, AESEncryptResponse, BinaryRequest,
     BinaryResponse, HuffmanRequest, HuffmanResponse, LZ77Request, LZ77Response,
     RSAKeyExchangeRequest, RSAKeyExchangeResponse,
 )
 from backend.pipeline import (
     binary_repr, compression, decryption_aes, decryption_rsa, encryption_aes, encryption_rsa,
-    source_encoding,
+    packetization, source_encoding,
 )
 
 APP_NAME = "Interactive Mathematical Simulator for Secure Digital Communication"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -404,6 +405,107 @@ def rsa_key_exchange(req: RSAKeyExchangeRequest) -> RSAKeyExchangeResponse:
                       "encryption_trace_matches_ciphertext": etrace["result"] == ciphertext,
                       "key_checks_all_ok": checks["all_ok"]},
         round_trip_ok=round_trip_ok, key_recovered_ok=key_recovered_ok,
+    )
+
+
+HEADER_CHECKSUM_NOTE = (
+    "The header checksum is the 16-bit Internet checksum (RFC 1071) over the 14 header bytes. It detects every "
+    "single-bit header error but NOT reordered 16-bit words, cancelling errors, or any change to the payload; "
+    "the CRC-32 stage that follows covers those.")
+
+
+def _packet_record(position: int, packet, status: str) -> dict:
+    preview = packet.payload[:MAX_PAYLOAD_PREVIEW_BYTES]
+    return {
+        "position": position, "sequence": packet.sequence, "total": packet.total,
+        "payload_length": packet.payload_length, "serialized_size": packet.serialized_size,
+        "header_hex": packet.header_bytes().hex(), "checksum": packet.checksum,
+        "checksum_hex": f"0x{packet.checksum:04x}", "checksum_valid": packet.header_ok(), "status": status,
+        "payload_hex": preview.hex(), "payload_truncated": len(preview) < packet.payload_length,
+    }
+
+
+def _packet_table(packets) -> list[dict]:
+    """Records in arrival order; a later copy of an already-seen valid sequence is marked 'duplicate'."""
+    seen: set[int] = set()
+    table = []
+    for pos, p in enumerate(packets[:MAX_PACKETS_RETURNED]):
+        if not p.header_ok():
+            status = "corrupted_header"
+        elif p.sequence in seen:
+            status = "duplicate"
+        else:
+            status = "ok"
+            seen.add(p.sequence)
+        table.append(_packet_record(pos, p, status))
+    return table
+
+
+@app.post("/api/packetize", response_model=PacketizeResponse, tags=["stage 6: packetization"])
+def packetize(req: PacketizeRequest) -> PacketizeResponse:
+    """Packetize data, optionally run a transmission experiment, reassemble, and report what was detected."""
+    data = req.text.encode("utf-8") if req.text is not None else bytes.fromhex(req.data_hex)
+    try:
+        packets = packetization.create_packets(data, req.payload_size)
+    except ValueError as exc:
+        raise ValidationFailure(str(exc)) from exc
+    count = len(packets)
+    for name in ("drop_sequences", "duplicate_sequences", "corrupt_header_sequences"):
+        bad = sorted({s for s in getattr(req, name) if s >= count})
+        if bad:
+            raise ValidationFailure(
+                f"{name}: sequence {bad[0]} does not exist (the message has {count} packet(s), numbered 0..{count - 1})",
+                [{"field": f"body.{name}", "message": "sequence out of range", "code": "sequence_out_of_range"}])
+
+    try:                                                                  # the untouched packets must round-trip
+        lossless_ok = packetization.reassemble_packets(packets) == data
+    except packetization.PacketError:                                     # a server-side inconsistency, not a user error
+        lossless_ok = False
+
+    # --- controlled experiment (deterministic order; see PacketizeRequest)
+    items = list(enumerate(packets))                                      # (original sequence, packet)
+    corrupted = sorted(set(req.corrupt_header_sequences))
+    for s in corrupted:
+        items[s] = (s, packetization.corrupt_header(packets[s]))
+    duplicated = sorted(set(req.duplicate_sequences))
+    dup_set = set(duplicated)
+    items = [it for orig, p in items for it in ([(orig, p), (orig, p)] if orig in dup_set else [(orig, p)])]
+    explicit_drops = sorted(set(req.drop_sequences))
+    drop_set = set(explicit_drops)
+    items = [it for it in items if it[0] not in drop_set]
+    survivors, lost_positions = packetization.drop_packets([p for _, p in items], req.loss_probability, req.seed)
+    random_lost = sorted({items[i][0] for i in lost_positions})
+    lost_pos = set(lost_positions)
+    items = [it for i, it in enumerate(items) if i not in lost_pos]
+    if req.shuffle:
+        random.Random(req.seed).shuffle(items)
+    received = [p for _, p in items]
+
+    allow = req.allow_identical_duplicates
+    diagnosis = packetization.inspect_packets(received, allow)
+    try:
+        recovered = packetization.reassemble_packets(received, allow)
+        reassembly = {"success": True, "error_kind": None, "message": None, "details": {},
+                      "recovered_bytes": len(recovered), "recovered_matches_original": recovered == data}
+    except packetization.PacketError as exc:
+        reassembly = {"success": False, "error_kind": exc.kind, "message": str(exc), "details": exc.details,
+                      "recovered_bytes": None, "recovered_matches_original": None}
+    experiment = {
+        "applied": bool(corrupted or duplicated or explicit_drops or req.loss_probability > 0 or req.shuffle),
+        "corrupted_header_sequences": corrupted, "duplicated_sequences": duplicated,
+        "dropped_sequences_explicit": explicit_drops, "dropped_sequences_random": random_lost,
+        "loss_probability": req.loss_probability, "seed": req.seed, "shuffled": req.shuffle,
+        "sent_count": count, "received_count": len(received),
+    }
+    table = _packet_table(packets)
+    received_table = _packet_table(received)
+    return PacketizeResponse(
+        data_bytes=len(data), payload_size=req.payload_size, header_size=packetization.HEADER_SIZE,
+        stats=packetization.packetization_stats(packets),
+        packets=table, packets_returned=len(table), packets_truncated=len(table) < count,
+        lossless_round_trip_ok=lossless_ok, experiment=experiment,
+        received_packets=received_table, received_truncated=len(received_table) < len(received),
+        diagnosis=diagnosis, reassembly=reassembly, header_checksum_note=HEADER_CHECKSUM_NOTE,
     )
 
 

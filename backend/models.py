@@ -7,7 +7,7 @@ request-body cap in ``main.py`` (HTTP 413).
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
 
@@ -28,6 +28,11 @@ DEFAULT_RSA_WRAP_BITS = 160      # default modulus when carrying a 128-bit AES k
 DEFAULT_RSA_INTEGER_BITS = 32    # default tiny modulus for the integer demonstration
 MIN_RSA_WRAP_BITS = 130          # smallest generated modulus guaranteed to exceed any 128-bit key
 MAX_DECIMAL_DIGITS = 78          # decimal strings for p, q, e (<= 259 bits)
+MAX_PACKETIZE_BYTES = 40_000     # bytes accepted by the packetization endpoint
+MAX_API_PAYLOAD_SIZE = 4096      # largest payload_size the API accepts (the module allows 65535)
+MAX_PACKETS_RETURNED = 256       # per-packet records returned per table (statistics cover ALL packets)
+MAX_PAYLOAD_PREVIEW_BYTES = 128  # payload bytes returned per packet record
+MAX_EXPERIMENT_SEQUENCES = 1000  # entries accepted in each drop/duplicate/corrupt list
 MAX_MESSAGE_DIGITS = 160         # decimal string for the integer message
 
 
@@ -464,3 +469,79 @@ class RSAKeyExchangeResponse(BaseModel):
     verification: dict[str, Any]
     round_trip_ok: bool
     key_recovered_ok: Optional[bool]
+
+
+# --------------------------------------------------------------------------- Stage 6: packetization
+SequenceNumber = Annotated[int, Field(strict=True, ge=0)]
+
+
+class PacketizeRequest(StrictModel):
+    """Split data into packets, then optionally run a controlled transmission experiment on them.
+
+    Experiment order (deterministic): corrupt headers -> duplicate -> drop (explicit, then random loss) -> shuffle.
+    Sequence numbers in the three lists refer to the ORIGINAL packet numbering (0 .. packet_count-1).
+    """
+    text: Optional[str] = Field(None, max_length=MAX_TEXT_CHARS)
+    data_hex: Optional[str] = Field(None, max_length=2 * MAX_PACKETIZE_BYTES)
+    payload_size: StrictInt = Field(64, ge=1, le=MAX_API_PAYLOAD_SIZE)
+    loss_probability: float = Field(0.0, ge=0, le=1, strict=True)
+    seed: Optional[StrictInt] = Field(None, ge=0, le=2 ** 32 - 1)
+    drop_sequences: list[SequenceNumber] = Field(default_factory=list, max_length=MAX_EXPERIMENT_SEQUENCES)
+    duplicate_sequences: list[SequenceNumber] = Field(default_factory=list, max_length=MAX_EXPERIMENT_SEQUENCES)
+    corrupt_header_sequences: list[SequenceNumber] = Field(default_factory=list, max_length=MAX_EXPERIMENT_SEQUENCES)
+    shuffle: StrictBool = False
+    allow_identical_duplicates: StrictBool = Field(
+        False, description="Tolerate repeated packets whose payload equals the first copy (conflicting copies never are).")
+
+    @field_validator("text")
+    @classmethod
+    def _text_is_utf8_encodable(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            try:
+                v.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError("text contains characters that cannot be encoded as UTF-8")
+        return v
+
+    @field_validator("data_hex")
+    @classmethod
+    def _data_hex_valid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_hex(v, "data_hex") if v is not None else v
+
+    @model_validator(mode="after")
+    def _exactly_one_input(self) -> "PacketizeRequest":
+        if (self.text is None) == (self.data_hex is None):
+            raise ValueError("provide exactly one of 'text' or 'data_hex'")
+        return self
+
+
+class PacketInfo(BaseModel):
+    position: int = Field(description="Arrival position in this table (0-based)")
+    sequence: int
+    total: int
+    payload_length: int
+    serialized_size: int = Field(description="header + payload bytes on the wire (not the payload size)")
+    header_hex: str
+    checksum: int
+    checksum_hex: str
+    checksum_valid: bool
+    status: str = Field(description="ok | corrupted_header | duplicate")
+    payload_hex: str = Field(description="First 128 payload bytes")
+    payload_truncated: bool
+
+
+class PacketizeResponse(BaseModel):
+    data_bytes: int
+    payload_size: int
+    header_size: int
+    stats: dict[str, Any]
+    packets: list[PacketInfo]
+    packets_returned: int
+    packets_truncated: bool
+    lossless_round_trip_ok: bool = Field(description="Reassembling the untouched packets reproduced the input exactly.")
+    experiment: dict[str, Any]
+    received_packets: list[PacketInfo]
+    received_truncated: bool
+    diagnosis: dict[str, Any]
+    reassembly: dict[str, Any]
+    header_checksum_note: str
