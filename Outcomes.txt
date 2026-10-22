@@ -5,9 +5,17 @@ Mathematical concepts demonstrated: None yet (scaffold only)
 Unit tests executed: 8 (tests/test_scaffold.py)
 Tests passed: 8
 Tests failed: 0
-API verification: see below
-Known limitations: see below
+
+Known limitations and notes
+
+Docs path: The spec lists both /docs and /api/docs, so I made both work. /docs is the FastAPI default; /api/docs is a small alias.
+Header controls: I left out the “Reset experiment” button because there is no experiment to reset yet. It will arrive with the orchestrator.
+Component stubs: I did not create stub files for frontend/components/ or the pipeline/ modules. They will be added as each stage is built.
+Deprecation warning: Starlette’s test client prints a warning that it prefers httpx2 over httpx. It is harmless and doesn’t affect any result.
+Environment: I used Python 3.10.12 with FastAPI 0.143.3, Pydantic 2.14.1 and pytest 9.1.1, all inside a virtual environment.
+
 Next checkpoint: 2 — GF(2⁸) arithmetic and S-box generation
+
 
 Checkpoint: 2 — GF(2⁸) arithmetic and S-box derivation
 Implemented modules: backend/pipeline/gf256.py, tests/test_gf256.py,
@@ -20,8 +28,9 @@ Unit tests executed: 47 total (38 GF(2⁸), 1 py3.10 guard, 8 scaffold)
 Tests passed: 47
 Tests failed: 0
 API verification: N/A. The spec defines no endpoint for this stage, and I added none.
-Known limitations: see below
+
 Next checkpoint: 3 — Huffman coding and binary representation
+
 
 Checkpoint: 3 — Huffman coding and binary representation
 Implemented modules: pipeline/source_encoding.py, pipeline/binary_repr.py,
@@ -34,8 +43,18 @@ Unit tests executed: 177 total (53 Huffman, 33 binary, 44 API, 38 GF(2⁸), 8 sc
 Tests passed: 177
 Tests failed: 0
 API verification: both endpoints checked against a live uvicorn server (details below)
-Known limitations: see below
+
+Known limitations and decisions
+
+No frontend yet: the frontend is unchanged. The spec schedules visualizations for Checkpoint 15, so the Huffman tree and byte grid aren’t drawn yet. The API already returns the data they need (tree, symbols, bytes).
+Code table cost: the encoded bit length does not include sending the code table, and the API says so explicitly (table_overhead_included: false). For short texts, real Huffman output can exceed plain UTF-8 once the table is counted.
+Single-symbol input: a text with one distinct symbol gets the code "0", giving efficiency 0% (entropy 0, length 1). This is a documented convention, not a mathematical result.
+Surrogate check: the surrogate check in models.py is redundant in this Pydantic version, because pydantic-core already rejects lone surrogates. I kept it as defense in depth, labeled that in a code comment, and tested it directly.
+Body-size limit: the 1 MB limit relies on the declared Content-Length. Chunked uploads without a length bypass it, but the 10,000-character field limit still applies.
+Text-length cap: 10,000 characters is my choice, since the spec only says “sensible limits”. Tell me if you want it changed.
+
 Next checkpoint: 4 — LZ77 compression
+
 
 Checkpoint: 4 — LZ77 compression
 Implemented modules: pipeline/compression.py, models.py (+LZ77 models), main.py (+endpoint),
@@ -48,7 +67,16 @@ Unit tests executed: 327 total (91 LZ77, 103 API, 53 Huffman, 38 GF(2⁸), 33 bi
 Tests passed: 327
 Tests failed: 0
 API verification: POST /api/compress/lz77 checked against a live uvicorn server (details below)
-Known limitations: see below
+
+Known limitations
+
+Greedy parsing: it is not optimal parsing, so an optimal parse could produce fewer tokens.
+Measured comparison: the numbers in the docs come from a single seeded run (seed 1). They show that Huffman is stuck at 1 bit/char on a low-entropy source (H = 0.466) and that LZ77 expands structureless random text (ratio 0.79). They are observations and not general laws.
+Response size: the API returns at most 2,000 token records (about 0.5 MB), while the statistics cover all tokens. tokens_truncated tells you when this applies.
+Parameters: window_size and lookahead_size must be agreed out of band, since the serialized form doesn’t store them.
+Size limits: the 40,000-byte input limit and the 32768/255 parameter caps are my choices, because the spec only says “sensible”.
+
+
 Next checkpoint: 5 — AES-128 (encryption and decryption, FIPS-197 vector, CBC)
 
 Checkpoint: 5 — AES-128 encryption and decryption
@@ -63,7 +91,17 @@ Unit tests executed: 504 total (81 AES, 199 API, 91 LZ77, 53 Huffman, 38 GF(2⁸
 Tests passed: 504
 Tests failed: 0
 API verification: POST /api/encrypt/aes and /api/decrypt/aes checked against a live uvicorn server
-Known limitations: see below
+
+Known limitations
+
+AES-128 only: AES-192/256 return a proper 501 and are not silently downgraded. The spec’s pipeline signature mentions aes_key_bits, so the orchestrator will accept 128 only and say so.
+Educational only: it is not constant-time and CBC has no integrity. Padding errors are distinguishable, which is a padding-oracle risk. This is stated in the code, the docs and every response (warning).
+Seeded keys: seeded keys use random.Random. They are reproducible for experiments and insecure.
+Response bounds: the API returns at most 64 per-block records (the ciphertext is always complete). The trace covers one chosen block.
+Size cap: the 40,000-byte limit is my choice.
+Equivalent mutant: one of the 95 mutants (pad length 0) is behaviorally equivalent, because the check was redundant. I pinned the specific error message instead.
+Quick correction on my audit line: the “1 files mention pow(” line above is just gf_pow( in the field module, which is GF exponentiation and not Python’s pow. The restriction on Python’s three-argument pow() applies to RSA, and no file uses it.
+
 Next checkpoint: 6 — RSA key exchange
 
 Checkpoint: 6 — RSA key exchange
@@ -79,5 +117,13 @@ Unit tests executed: 774 total (318 API, 151 RSA, 91 LZ77, 81 AES, 53 Huffman, 3
 Tests passed: 774
 Tests failed: 0
 API verification: POST /api/encrypt/rsa-keyexchange checked against a live uvicorn server
-Known limitations: see below
+
+Known limitations
+
+Textbook RSA: it has no OAEP (deterministic, malleable), and every response says so. OAEP would need a hash and mask function from first principles.
+Insecure keys: all keys are insecure, even the 160-bit ones. Seeded keys use random.Random and are reproducible, not secure.
+Probabilistic primality: above 3.3×10²⁴ the test is probabilistic, with error below 4⁻²⁰ per composite.
+Caps: modulus 12–512 bits in the API (1024 in the library) and p, q up to 256 bits. These are my choices.
+What is returned: d, p, q and φ are returned because showing them is the point of the demonstration. A supplied AES key appears in the traces as an integer unless include_traces: false.
+
 Next checkpoint: 7 — Packetization
