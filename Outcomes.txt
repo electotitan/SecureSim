@@ -127,3 +127,26 @@ Caps: modulus 12–512 bits in the API (1024 in the library) and p, q up to 256 
 What is returned: d, p, q and φ are returned because showing them is the point of the demonstration. A supplied AES key appears in the traces as an integer unless include_traces: false.
 
 Next checkpoint: 7 — Packetization
+
+Checkpoint: 7 — Packetization
+Implemented modules: pipeline/packetization.py (new), models.py, main.py (POST /api/packetize),
+                     tests/test_packetization.py (132 new), tests/test_api.py (+96 packetization tests),
+                     docs §9 and API reference
+Mathematical concepts demonstrated: framing and fragmentation arithmetic, one's-complement
+                     arithmetic with end-around carry (Internet checksum, RFC 1071), overhead
+                     versus payload size, reassembly invariants
+Unit tests executed: 1002 total (414 API, 151 RSA, 132 packetization, 91 LZ77, 81 AES, 53 Huffman,
+                     38 GF(2⁸), 33 binary, 8 scaffold, 1 py3.10 guard)
+Tests passed: 1002
+Tests failed: 0
+API verification: POST /api/packetize checked against a live uvicorn server
+
+Known limitations
+
+No message ID: the format has none, because the spec lists only sequence, total, payload and checksum. Two messages with the same total and non-overlapping sequences could therefore be mixed without detection. Only conflicting duplicates and mismatched totals are caught.
+Weak header checksum: it is only the first layer. Payload integrity and reordering detection come from CRC-32 next.
+Experiment scope: packet-level loss and corruption only. The bit-level channel comes in Checkpoint 10.
+Seeded randomness: seeded loss and shuffling use random.Random, which is reproducible and not secure.
+API caps: payload_size ≤ 4096 and data ≤ 40,000 bytes (the module allows 65,535-byte payloads), 256 table rows and 128 preview bytes per packet. These are my choices.
+
+Next checkpoint: 8 — CRC-32 error detection
