@@ -15,6 +15,7 @@ Stage endpoints are added checkpoint by checkpoint:
   * POST /api/decrypt/aes     (Checkpoint 5)
   * POST /api/encrypt/rsa-keyexchange (Checkpoint 6)
   * POST /api/packetize        (Checkpoint 7)
+  * POST /api/error-detect/crc (Checkpoint 8)
 """
 from __future__ import annotations
 
@@ -30,18 +31,19 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from backend.errors import IntegrityFailure, ValidationFailure, error_body, register_error_handlers
 from backend.models import (
     DEFAULT_RSA_INTEGER_BITS, DEFAULT_RSA_WRAP_BITS, MAX_AES_BLOCKS_RETURNED, MAX_BODY_BYTES,
-    MAX_PACKETS_RETURNED, MAX_PAYLOAD_PREVIEW_BYTES, MAX_RSA_PRIME_BITS, MAX_RSA_STEPS_RETURNED,
-    MAX_TOKENS_RETURNED, MIN_RSA_WRAP_BITS, PacketizeRequest, PacketizeResponse, AESDecryptRequest, AESDecryptResponse, AESEncryptRequest, AESEncryptResponse, BinaryRequest,
+    MAX_FLIPPED_BITS_LISTED, MAX_PACKETS_RETURNED, MAX_PAYLOAD_PREVIEW_BYTES, MAX_RSA_PRIME_BITS,
+    MAX_RSA_STEPS_RETURNED, MAX_TOKENS_RETURNED, MIN_RSA_WRAP_BITS, CRCRequest, CRCResponse,
+    PacketizeRequest, PacketizeResponse, AESDecryptRequest, AESDecryptResponse, AESEncryptRequest, AESEncryptResponse, BinaryRequest,
     BinaryResponse, HuffmanRequest, HuffmanResponse, LZ77Request, LZ77Response,
     RSAKeyExchangeRequest, RSAKeyExchangeResponse,
 )
 from backend.pipeline import (
     binary_repr, compression, decryption_aes, decryption_rsa, encryption_aes, encryption_rsa,
-    packetization, source_encoding,
+    error_detection_crc, packetization, source_encoding,
 )
 
 APP_NAME = "Interactive Mathematical Simulator for Secure Digital Communication"
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -506,6 +508,102 @@ def packetize(req: PacketizeRequest) -> PacketizeResponse:
         lossless_round_trip_ok=lossless_ok, experiment=experiment,
         received_packets=received_table, received_truncated=len(received_table) < len(received),
         diagnosis=diagnosis, reassembly=reassembly, header_checksum_note=HEADER_CHECKSUM_NOTE,
+    )
+
+
+CRC_PROPERTIES = [
+    "A CRC DETECTS errors; it never corrects them. A mismatch says something changed, not where or how.",
+    "CRC-32 detects every single-bit error and every error burst of 32 bits or fewer, because an error polynomial of "
+    "degree below 32 can never be a nonzero multiple of the generator polynomial.",
+    "Other error patterns escape detection with probability about 2^-32 (2.3e-10) for random damage; specific patterns "
+    "that are multiples of the generator polynomial are invisible.",
+    "A CRC is linear over GF(2), so it is NOT authentication: anyone can compute 4 bytes that force any chosen CRC "
+    "(see 'forge_to_match_original'). Use a MAC such as HMAC for tamper protection.",
+]
+CRC_ESCAPE_PROBABILITY = 2.0 ** -32
+
+
+def _net_flipped_bits(before: bytes, after: bytes) -> list[int]:
+    return [8 * i + k for i, (a, b) in enumerate(zip(before, after)) if a != b for k in range(8) if ((a ^ b) >> k) & 1]
+
+
+@app.post("/api/error-detect/crc", response_model=CRCResponse, tags=["stage 7: error detection"])
+def crc_error_detection(req: CRCRequest) -> CRCResponse:
+    """CRC-32 with its derivation, optional verification, deliberate corruption and CRC forging."""
+    crc = error_detection_crc
+    data = req.text.encode("utf-8") if req.text is not None else bytes.fromhex(req.data_hex)
+    checksum = crc.crc32_compute(data)
+    le = checksum.to_bytes(4, "little")
+    cross = {"bitwise_matches_table": crc.crc32_bitwise(data) == checksum,
+             "polynomial_division_matches": crc.crc32_polynomial_division(data) == checksum}
+    cross["all_agree"] = all(cross.values())
+
+    verification = None
+    if req.expected_crc_hex is not None:
+        expected = int(req.expected_crc_hex, 16)
+        verification = {"expected_crc32": expected, "expected_crc32_hex": f"0x{expected:08x}",
+                        "computed_crc32_hex": f"0x{checksum:08x}", "matches": crc.crc32_verify(data, expected)}
+
+    corruption = forged = None
+    if req.flip_bits or req.burst_length is not None:
+        nbits = 8 * len(data)
+        bad = sorted({b for b in req.flip_bits if b >= nbits})
+        if bad:
+            raise ValidationFailure(
+                f"flip_bits: bit {bad[0]} is outside the data ({nbits} bits)",
+                [{"field": "body.flip_bits", "message": "bit out of range", "code": "bit_out_of_range"}])
+        burst = []
+        if req.burst_length is not None:
+            if req.burst_start_bit + req.burst_length > nbits:
+                raise ValidationFailure(
+                    f"the burst (bits {req.burst_start_bit}..{req.burst_start_bit + req.burst_length - 1}) "
+                    f"extends beyond the data ({nbits} bits)",
+                    [{"field": "body.burst_start_bit", "message": "burst out of range", "code": "burst_out_of_range"}])
+            burst = list(range(req.burst_start_bit, req.burst_start_bit + req.burst_length))
+        corrupted = crc.flip_bits(crc.flip_bits(data, req.flip_bits), burst)
+        net = _net_flipped_bits(data, corrupted)
+        span = crc.error_span(net)
+        corrupted_crc = crc.crc32_compute(corrupted)
+        detected = corrupted_crc != checksum
+        guaranteed = None if span is None else span <= 32
+        corruption = {
+            "applied": True, "net_change": bool(net), "flipped_bit_count": len(net),
+            "flipped_bits": net[:MAX_FLIPPED_BITS_LISTED], "flipped_bits_truncated": len(net) > MAX_FLIPPED_BITS_LISTED,
+            "changed_byte_indices": sorted({p // 8 for p in net})[:64],
+            "error_span_bits": span, "guaranteed_detection": guaranteed,
+            "guarantee_consistent": (not guaranteed) or detected,
+            "original_crc32": checksum, "original_crc32_hex": f"0x{checksum:08x}",
+            "corrupted_crc32": corrupted_crc, "corrupted_crc32_hex": f"0x{corrupted_crc:08x}",
+            "detected": detected, "verified_against_original": crc.crc32_verify(corrupted, checksum),
+            "corrupted_data_hex_preview": corrupted[:128].hex(), "corrupted_data_truncated": len(corrupted) > 128,
+            "escape_probability_for_random_errors": CRC_ESCAPE_PROBABILITY,
+        }
+        if req.forge_to_match_original:
+            suffix = crc.crc32_forge_suffix(corrupted, checksum)
+            forged_data = corrupted + suffix
+            forged_crc = crc.crc32_compute(forged_data)
+            forged = {
+                "applied": True, "suffix_hex": suffix.hex(), "length_changed_by_bytes": 4,
+                "forged_crc32": forged_crc, "forged_crc32_hex": f"0x{forged_crc:08x}",
+                "matches_original": forged_crc == checksum, "detected_by_crc": forged_crc != checksum,
+                "content_changed_before_forging": corrupted != data,
+                "note": "The CRC was repaired by appending 4 computed bytes: a CRC cannot authenticate data.",
+            }
+    return CRCResponse(
+        data_bytes=len(data), crc32=checksum, crc32_hex=f"0x{checksum:08x}", crc32_little_endian_hex=le.hex(),
+        parameters={"width": 32, "polynomial_normal_hex": f"0x{crc.POLY_NORMAL:08x}",
+                    "polynomial_reflected_hex": f"0x{crc.POLY_REFLECTED:08x}", "init_hex": f"0x{crc.INIT:08x}",
+                    "xorout_hex": f"0x{crc.XOROUT:08x}", "reflect_input": True, "reflect_output": True,
+                    "check_input": crc.CHECK_INPUT.decode("ascii"), "check_value_hex": f"0x{crc.CHECK_VALUE:08x}"},
+        polynomial={"expression": crc.polynomial_expression(), "terms": crc.polynomial_terms(),
+                    "degree": 32, "full_hex": f"0x{crc.POLY_FULL:x}"},
+        cross_checks=cross,
+        standard_check_value_ok=crc.crc32_compute(crc.CHECK_INPUT) == crc.CHECK_VALUE,
+        residue_check=crc.crc32_compute(data + le) == crc.RESIDUE,
+        verification=verification,
+        trace=crc.crc32_trace(data, req.trace_bytes, req.bit_trace_bytes),
+        table_hex=[f"0x{v:08x}" for v in crc.crc32_table()] if req.include_table else None,
+        corruption=corruption, forged=forged, properties=CRC_PROPERTIES,
     )
 
 

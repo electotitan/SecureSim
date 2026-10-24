@@ -1936,3 +1936,400 @@ def test_packetize_received_table_is_bounded_independently_of_the_sent_table():
     just = pk_post(data_hex="ab" * 300, payload_size=1, drop_sequences=list(range(100))).json()      # 300 sent, 200 received
     assert just["packets_truncated"] is True and just["received_truncated"] is False
     assert len(just["received_packets"]) == 200
+
+
+# ====================================================================== Checkpoint 8: CRC-32 endpoint
+import zlib
+
+from backend.pipeline import error_detection_crc as _crc
+
+CRCP = "/api/error-detect/crc"
+
+
+def crc_post(**body):
+    return client.post(CRCP, json=body)
+
+
+# ------------------------------------------------------------------ the checksum itself
+def test_crc_api_standard_check_value():
+    d = crc_post(text="123456789").json()
+    assert d["crc32"] == 0xCBF43926 and d["crc32_hex"] == "0xcbf43926" and d["data_bytes"] == 9
+    assert d["standard_check_value_ok"] is True and d["residue_check"] is True
+    assert d["crc32_little_endian_hex"] == "2639f4cb" and d["cross_checks"] == {
+        "bitwise_matches_table": True, "polynomial_division_matches": True, "all_agree": True}
+
+
+@pytest.mark.parametrize("data", [b"", b"a", b"abc", b"hello world", bytes(32), bytes(range(256)), b"\xff" * 100])
+def test_crc_api_matches_the_independent_reference(data):
+    d = crc_post(data_hex=data.hex()).json()
+    assert d["crc32"] == zlib.crc32(data) and d["crc32_hex"] == f"0x{zlib.crc32(data):08x}"
+    assert d["cross_checks"]["all_agree"] is True and d["residue_check"] is True
+
+
+def test_crc_api_text_is_hashed_by_its_utf8_bytes():
+    assert crc_post(text="é😀").json()["crc32"] == zlib.crc32("é😀".encode())
+    assert crc_post(text="").json()["crc32"] == 0 and crc_post(text="").json()["data_bytes"] == 0
+
+
+def test_crc_api_parameters_and_polynomial_representation():
+    d = crc_post(text="x").json()
+    assert d["parameters"] == {"width": 32, "polynomial_normal_hex": "0x04c11db7", "polynomial_reflected_hex": "0xedb88320",
+                               "init_hex": "0xffffffff", "xorout_hex": "0xffffffff", "reflect_input": True,
+                               "reflect_output": True, "check_input": "123456789", "check_value_hex": "0xcbf43926"}
+    assert d["polynomial"]["terms"] == [32, 26, 23, 22, 16, 12, 11, 10, 8, 7, 5, 4, 2, 1, 0] and d["polynomial"]["degree"] == 32
+    assert d["polynomial"]["expression"] == "x^32 + x^26 + x^23 + x^22 + x^16 + x^12 + x^11 + x^10 + x^8 + x^7 + x^5 + x^4 + x^2 + x + 1"
+    assert d["polynomial"]["full_hex"] == "0x104c11db7"
+
+
+def test_crc_api_table_is_derived_and_complete():
+    d = crc_post(text="x").json()
+    t = d["table_hex"]
+    assert len(t) == 256 and t[0] == "0x00000000" and t[1] == "0x77073096" and t[255] == "0x2d02ef8d"
+    assert [int(x, 16) for x in t] == list(_crc.crc32_table())
+    assert crc_post(text="x", include_table=False).json()["table_hex"] is None
+
+
+def test_crc_api_properties_text_states_the_limits():
+    props = " ".join(crc_post(text="x").json()["properties"]).lower()
+    assert "never corrects" in props and "not authentication" in props and "burst" in props and "2^-32" in props
+
+
+def test_crc_api_is_deterministic():
+    assert crc_post(text="same", flip_bits=[3]).json() == crc_post(text="same", flip_bits=[3]).json()
+
+
+# ------------------------------------------------------------------ the trace
+def test_crc_api_trace_register_chain_for_the_check_string():
+    tr = crc_post(text="123456789", trace_bytes=9, bit_trace_bytes=3).json()["trace"]
+    assert tr["initial_register"] == 0xFFFFFFFF and tr["checksum"] == 0xCBF43926 and tr["final_xor"] == 0xFFFFFFFF
+    steps = tr["byte_steps"]
+    assert [s["byte"] for s in steps] == list(b"123456789") and steps[0]["register_before"] == 0xFFFFFFFF
+    for a, b in zip(steps, steps[1:]):
+        assert b["register_before"] == a["register_after"]
+    assert steps[-1]["register_after"] == tr["final_register"] == 0xCBF43926 ^ 0xFFFFFFFF
+    for s in steps:                                                       # re-derived here with plain arithmetic
+        idx = (s["register_before"] ^ s["byte"]) & 0xFF
+        reg = idx
+        for _ in range(8):
+            reg = (reg >> 1) ^ 0xEDB88320 if reg & 1 else reg >> 1
+        assert s["table_index"] == idx and s["table_value"] == reg
+        assert s["register_after"] == reg ^ (s["register_before"] >> 8)
+    assert len(tr["bit_steps"]) == 3 and all(len(b["steps"]) == 9 for b in tr["bit_steps"])
+    assert tr["bit_steps"][0]["steps"][-1]["register"] == steps[0]["register_after"]
+
+
+def test_crc_api_trace_is_bounded_but_the_checksum_is_exact():
+    data = bytes(range(256)) * 20                                        # 5120 bytes
+    d = crc_post(data_hex=data.hex(), trace_bytes=256, bit_trace_bytes=8).json()
+    assert d["trace"]["steps_total"] == 5120 and d["trace"]["steps_returned"] == 256 and d["trace"]["steps_truncated"] is True
+    assert len(d["trace"]["bit_steps"]) == 8 and d["crc32"] == zlib.crc32(data) == d["trace"]["checksum"]
+    small = crc_post(data_hex="aabb", trace_bytes=0, bit_trace_bytes=0).json()["trace"]
+    assert small["byte_steps"] == [] and small["bit_steps"] == [] and small["steps_total"] == 2 and small["steps_truncated"] is True
+
+
+def test_crc_api_trace_of_empty_data():
+    tr = crc_post(text="").json()["trace"]
+    assert tr["byte_steps"] == [] and tr["final_register"] == 0xFFFFFFFF and tr["checksum"] == 0 and tr["steps_truncated"] is False
+
+
+# ------------------------------------------------------------------ verification against an expected CRC
+def test_crc_api_verification():
+    ok = crc_post(text="123456789", expected_crc_hex="cbf43926").json()["verification"]
+    assert ok == {"expected_crc32": 0xCBF43926, "expected_crc32_hex": "0xcbf43926", "computed_crc32_hex": "0xcbf43926", "matches": True}
+    assert crc_post(text="123456789", expected_crc_hex="CBF43926").json()["verification"]["matches"] is True      # case-insensitive
+    bad = crc_post(text="123456789", expected_crc_hex="cbf43927").json()["verification"]
+    assert bad["matches"] is False and bad["expected_crc32"] == 0xCBF43927
+    assert crc_post(text="123456789").json()["verification"] is None
+    assert crc_post(text="", expected_crc_hex="00000000").json()["verification"]["matches"] is True
+
+
+# ------------------------------------------------------------------ corruption experiments
+def test_crc_api_single_bit_error_is_always_detected_and_guaranteed():
+    for bit in (0, 1, 7, 8, 40, 87):
+        c = crc_post(text="hello world", flip_bits=[bit]).json()["corruption"]
+        assert c["detected"] is True and c["guaranteed_detection"] is True and c["guarantee_consistent"] is True
+        assert c["flipped_bits"] == [bit] and c["flipped_bit_count"] == 1 and c["error_span_bits"] == 1
+        assert c["changed_byte_indices"] == [bit // 8] and c["net_change"] is True
+        assert c["original_crc32"] != c["corrupted_crc32"] and c["verified_against_original"] is False
+
+
+def test_crc_api_corrupted_checksum_matches_the_independent_reference():
+    data = b"hello world"
+    c = crc_post(data_hex=data.hex(), flip_bits=[10, 60]).json()["corruption"]
+    corrupted = bytearray(data)
+    corrupted[1] ^= 1 << 2                                               # bit 10 = byte 1, bit 2
+    corrupted[7] ^= 1 << 4                                               # bit 60 = byte 7, bit 4
+    assert c["corrupted_crc32"] == zlib.crc32(bytes(corrupted)) and c["original_crc32"] == zlib.crc32(data)
+    assert c["corrupted_data_hex_preview"] == bytes(corrupted).hex() and c["corrupted_data_truncated"] is False
+
+
+def test_crc_api_bit_order_is_lsb_first_within_each_byte():
+    c = crc_post(data_hex="0000", flip_bits=[0, 15]).json()["corruption"]
+    assert c["corrupted_data_hex_preview"] == "0180"
+
+
+@pytest.mark.parametrize("length", [1, 2, 7, 16, 31, 32])
+def test_crc_api_bursts_up_to_32_bits_are_guaranteed_and_detected(length):
+    for start in (0, 5, 17, 100):
+        c = crc_post(data_hex=bytes(range(40)).hex(), burst_start_bit=start, burst_length=length).json()["corruption"]
+        assert c["error_span_bits"] == length and c["flipped_bit_count"] == length
+        assert c["guaranteed_detection"] is True and c["detected"] is True and c["guarantee_consistent"] is True
+        assert c["flipped_bits"] == list(range(start, start + length))
+
+
+def test_crc_api_a_33_bit_error_shaped_like_the_generator_is_not_detected_and_not_guaranteed():
+    data = bytes(range(8))
+    n, k = 64, 5
+    pos = sorted(n - 1 - (e + k) for e in _crc.polynomial_terms())
+    c = crc_post(data_hex=data.hex(), flip_bits=pos).json()["corruption"]
+    assert c["error_span_bits"] == 33 and c["guaranteed_detection"] is False and c["flipped_bit_count"] == 15
+    assert c["detected"] is False and c["original_crc32"] == c["corrupted_crc32"]             # the corruption escapes
+    assert c["verified_against_original"] is True and c["guarantee_consistent"] is True
+    assert c["escape_probability_for_random_errors"] == 2.0 ** -32
+
+
+def test_crc_api_bursts_beyond_32_bits_are_usually_detected_but_never_guaranteed():
+    c = crc_post(data_hex=bytes(range(40)).hex(), burst_start_bit=3, burst_length=64).json()["corruption"]
+    assert c["error_span_bits"] == 64 and c["guaranteed_detection"] is False and c["detected"] is True
+
+
+def test_crc_api_flips_listed_twice_cancel_and_the_net_change_is_reported():
+    c = crc_post(text="abc", flip_bits=[3, 3]).json()["corruption"]
+    assert c["applied"] is True and c["net_change"] is False and c["flipped_bit_count"] == 0 and c["flipped_bits"] == []
+    assert c["detected"] is False and c["error_span_bits"] is None and c["guaranteed_detection"] is None
+    assert c["guarantee_consistent"] is True and c["changed_byte_indices"] == []
+    c = crc_post(text="abc", flip_bits=[3, 3, 3]).json()["corruption"]
+    assert c["flipped_bits"] == [3] and c["detected"] is True
+
+
+def test_crc_api_flip_and_burst_overlap_cancel_where_they_coincide():
+    c = crc_post(data_hex="00" * 4, flip_bits=[2, 3, 30], burst_start_bit=2, burst_length=3).json()["corruption"]
+    assert c["flipped_bits"] == [4, 30] and c["error_span_bits"] == 27 and c["detected"] is True      # 2 and 3 cancel, 4 flips
+
+
+def test_crc_api_net_flip_list_is_bounded_but_counts_are_exact():
+    c = crc_post(data_hex="00" * 1000, burst_start_bit=0, burst_length=4096).json()["corruption"]
+    assert c["flipped_bit_count"] == 4096 and len(c["flipped_bits"]) == 1000 and c["flipped_bits_truncated"] is True
+    assert c["error_span_bits"] == 4096 and c["guaranteed_detection"] is False
+
+
+def test_crc_api_preview_of_corrupted_data_is_bounded():
+    c = crc_post(data_hex="00" * 500, flip_bits=[0]).json()["corruption"]
+    assert len(c["corrupted_data_hex_preview"]) == 256 and c["corrupted_data_truncated"] is True
+
+
+def test_crc_api_no_corruption_means_no_corruption_object():
+    d = crc_post(text="abc").json()
+    assert d["corruption"] is None and d["forged"] is None
+
+
+# ------------------------------------------------------------------ forging
+def test_crc_api_forged_message_passes_the_crc_check():
+    original = b"Transfer 100 EUR to 1234"
+    d = crc_post(data_hex=original.hex(), flip_bits=[8 * 9 + 1, 8 * 10], forge_to_match_original=True).json()
+    f, c = d["forged"], d["corruption"]
+    assert c["detected"] is True                                          # the raw corruption IS detected ...
+    assert f["applied"] is True and f["matches_original"] is True and f["detected_by_crc"] is False   # ... until it is forged
+    assert f["forged_crc32"] == d["crc32"] and f["forged_crc32_hex"] == d["crc32_hex"] and f["content_changed_before_forging"] is True
+    assert f["length_changed_by_bytes"] == 4 and len(f["suffix_hex"]) == 8 and "authenticate" in f["note"]
+    tampered = bytes.fromhex(c["corrupted_data_hex_preview"])
+    assert zlib.crc32(tampered + bytes.fromhex(f["suffix_hex"])) == zlib.crc32(original)              # independent verification
+
+
+def test_crc_api_forging_matches_the_library_suffix():
+    data = b"payload bytes"
+    d = crc_post(data_hex=data.hex(), flip_bits=[0], forge_to_match_original=True).json()
+    corrupted = _crc.flip_bits(data, [0])
+    assert d["forged"]["suffix_hex"] == _crc.crc32_forge_suffix(corrupted, zlib.crc32(data)).hex()
+
+
+def test_crc_api_forging_also_works_when_the_corruption_was_already_undetected():
+    data = bytes(range(8))
+    pos = sorted(63 - (e + 5) for e in _crc.polynomial_terms())
+    d = crc_post(data_hex=data.hex(), flip_bits=pos, forge_to_match_original=True).json()
+    assert d["corruption"]["detected"] is False and d["forged"]["matches_original"] is True
+
+
+# ------------------------------------------------------------------ validation
+def test_crc_api_bit_positions_must_exist():
+    err = assert_error(crc_post(text="abc", flip_bits=[24]), 422)
+    assert err["details"][0]["field"] == "body.flip_bits" and err["details"][0]["code"] == "bit_out_of_range"
+    assert "outside the data (24 bits)" in err["message"]
+    assert crc_post(text="abc", flip_bits=[23]).status_code == 200
+    err = assert_error(crc_post(text="", flip_bits=[0]), 422)
+    assert "0 bits" in err["message"]
+
+
+def test_crc_api_burst_must_fit_inside_the_data():
+    err = assert_error(crc_post(text="abc", burst_start_bit=20, burst_length=5), 422)
+    assert err["details"][0]["field"] == "body.burst_start_bit" and err["details"][0]["code"] == "burst_out_of_range"
+    assert crc_post(text="abc", burst_start_bit=20, burst_length=4).status_code == 200      # ends exactly at bit 23
+    assert_error(crc_post(text="abc", burst_start_bit=24, burst_length=1), 422)
+
+
+@pytest.mark.parametrize("body, field, code", [
+    ({"flip_bits": [-1]}, "body.flip_bits.0", "greater_than_equal"),
+    ({"flip_bits": [1.5]}, "body.flip_bits.0", "int_type"), ({"flip_bits": [True]}, "body.flip_bits.0", "int_type"),
+    ({"flip_bits": ["3"]}, "body.flip_bits.0", "int_type"), ({"flip_bits": 3}, "body.flip_bits", "list_type"),
+    ({"flip_bits": [0] * 1001}, "body.flip_bits", "too_long"),
+    ({"burst_start_bit": -1, "burst_length": 2}, "body.burst_start_bit", "greater_than_equal"),
+    ({"burst_start_bit": 1.5, "burst_length": 2}, "body.burst_start_bit", "int_type"),
+    ({"burst_start_bit": 0, "burst_length": 0}, "body.burst_length", "greater_than_equal"),
+    ({"burst_start_bit": 0, "burst_length": 4097}, "body.burst_length", "less_than_equal"),
+    ({"burst_start_bit": 0, "burst_length": "3"}, "body.burst_length", "int_type"),
+    ({"burst_start_bit": 0, "burst_length": True}, "body.burst_length", "int_type"),
+    ({"trace_bytes": -1}, "body.trace_bytes", "greater_than_equal"), ({"trace_bytes": 257}, "body.trace_bytes", "less_than_equal"),
+    ({"trace_bytes": "4"}, "body.trace_bytes", "int_type"), ({"trace_bytes": 2.0}, "body.trace_bytes", "int_type"),
+    ({"bit_trace_bytes": -1}, "body.bit_trace_bytes", "greater_than_equal"),
+    ({"bit_trace_bytes": 9}, "body.bit_trace_bytes", "less_than_equal"), ({"bit_trace_bytes": True}, "body.bit_trace_bytes", "int_type"),
+    ({"include_table": "yes"}, "body.include_table", "bool_type"), ({"include_table": 1}, "body.include_table", "bool_type"),
+    ({"forge_to_match_original": "yes"}, "body.forge_to_match_original", "bool_type"),
+    ({"expected_crc_hex": "abc"}, "body.expected_crc_hex", "string_too_short"),
+    ({"expected_crc_hex": "abcdef012"}, "body.expected_crc_hex", "string_too_long"),
+    ({"expected_crc_hex": "zzzzzzzz"}, "body.expected_crc_hex", "value_error"),
+    ({"expected_crc_hex": "0xabcdef"}, "body.expected_crc_hex", "value_error"),
+    ({"expected_crc_hex": 12345678}, "body.expected_crc_hex", "string_type"),
+    ({"data_hex": "abc"}, "body.data_hex", "value_error"), ({"data_hex": "zz"}, "body.data_hex", "value_error"),
+    ({"text": 123}, "body.text", "string_type"),
+])
+def test_crc_api_validation_errors_name_the_field_and_the_rule(body, field, code):
+    body = body if ("data_hex" in body or "text" in body) else {"text": "abc", **body}
+    err = assert_error(crc_post(**body), 422)
+    assert err["details"][0]["field"] == field and err["details"][0]["code"] == code, err["details"]
+
+
+@pytest.mark.parametrize("body, fragment", [
+    ({}, "exactly one"), ({"text": "a", "data_hex": "61"}, "exactly one"),
+    ({"text": "abc", "burst_start_bit": 1}, "both 'burst_start_bit' and 'burst_length'"),
+    ({"text": "abc", "burst_length": 3}, "both 'burst_start_bit' and 'burst_length'"),
+    ({"text": "abc", "forge_to_match_original": True}, "needs a corruption"),
+])
+def test_crc_api_conflicting_fields_rejected(body, fragment):
+    err = assert_error(crc_post(**body), 422)
+    assert err["details"][0]["field"] == "body" and fragment in err["details"][0]["message"]
+
+
+def test_crc_api_forging_accepts_either_kind_of_corruption():
+    assert crc_post(text="abc", flip_bits=[1], forge_to_match_original=True).status_code == 200
+    assert crc_post(text="abc", burst_start_bit=1, burst_length=2, forge_to_match_original=True).status_code == 200
+
+
+def test_crc_api_size_limits_extras_and_methods():
+    assert crc_post(data_hex="ab" * 40_000, include_table=False).json()["crc32"] == zlib.crc32(b"\xab" * 40_000)
+    err = assert_error(crc_post(data_hex="ab" * 40_001), 422)
+    assert err["details"][0]["field"] == "body.data_hex"
+    assert_error(crc_post(text="a" * (MAX_TEXT_CHARS + 1)), 422)
+    assert_error(crc_post(text="a", bogus=1), 422)
+    assert_error(client.post(CRCP, content="{nope", headers={"content-type": "application/json"}), 422)
+    assert_error(client.post(CRCP, content='{"text": "x \\ud800"}', headers={"content-type": "application/json"}), 422)
+    big = json.dumps({"text": "a" * (MAX_BODY_BYTES + 10)})
+    assert_error(client.post(CRCP, content=big, headers={"content-type": "application/json"}), 413)
+    assert_error(client.get(CRCP), 405, "http_error")
+
+
+def test_crc_api_errors_do_not_echo_the_data():
+    r = crc_post(text="TOP-SECRET-DATA", flip_bits=[10 ** 6])
+    assert r.status_code == 422 and "TOP-SECRET-DATA" not in r.text
+
+
+# ------------------------------------------------------------------ honesty of computed fields
+def test_crc_api_cross_checks_are_computed_not_hardcoded(monkeypatch):
+    import backend.main as m
+    monkeypatch.setattr(m.error_detection_crc, "crc32_bitwise", lambda d: 0)
+    c = crc_post(text="abc").json()["cross_checks"]
+    assert c["bitwise_matches_table"] is False and c["polynomial_division_matches"] is True and c["all_agree"] is False
+    monkeypatch.undo()
+    monkeypatch.setattr(m.error_detection_crc, "crc32_polynomial_division", lambda d: 0)
+    c = crc_post(text="abc").json()["cross_checks"]
+    assert c["polynomial_division_matches"] is False and c["bitwise_matches_table"] is True and c["all_agree"] is False
+
+
+def test_crc_api_standard_check_value_flag_is_computed(monkeypatch):
+    import backend.main as m
+    monkeypatch.setattr(m.error_detection_crc, "CHECK_VALUE", 0x12345678)
+    assert crc_post(text="abc").json()["standard_check_value_ok"] is False
+
+
+def test_crc_api_residue_flag_is_computed(monkeypatch):
+    import backend.main as m
+    monkeypatch.setattr(m.error_detection_crc, "RESIDUE", 0)
+    assert crc_post(text="abc").json()["residue_check"] is False
+
+
+def test_crc_api_guarantee_is_consistent_when_the_corrupted_checksum_really_differs(monkeypatch):
+    import backend.main as m
+    real = m.error_detection_crc.crc32_compute
+    calls = {"n": 0}
+
+    def second_call_differs(data, previous=0):
+        calls["n"] += 1
+        return real(data, previous) if calls["n"] == 1 else 0          # original is real; the corrupted data gets CRC 0
+
+    monkeypatch.setattr(m.error_detection_crc, "crc32_compute", second_call_differs)
+    c = crc_post(text="hello", flip_bits=[0]).json()["corruption"]
+    assert c["guaranteed_detection"] is True and c["detected"] is True and c["guarantee_consistent"] is True
+
+
+def test_crc_api_guarantee_inconsistency_is_reported_not_hidden(monkeypatch):
+    import backend.main as m
+    monkeypatch.setattr(m.error_detection_crc, "crc32_compute", lambda data, previous=0: 123)      # everything collides
+    c = crc_post(text="hello", flip_bits=[0]).json()["corruption"]
+    assert c["guaranteed_detection"] is True and c["detected"] is False and c["guarantee_consistent"] is False
+
+
+def test_crc_api_forged_flags_are_computed(monkeypatch):
+    import backend.main as m
+    monkeypatch.setattr(m.error_detection_crc, "crc32_forge_suffix", lambda data, target: b"\x00\x00\x00\x00")
+    f = crc_post(text="hello", flip_bits=[0], forge_to_match_original=True).json()["forged"]
+    assert f["matches_original"] is False and f["detected_by_crc"] is True        # a wrong forgery is reported as such
+
+
+def test_crc_api_verification_is_computed(monkeypatch):
+    import backend.main as m
+    monkeypatch.setattr(m.error_detection_crc, "crc32_verify", lambda data, checksum: False)
+    assert crc_post(text="123456789", expected_crc_hex="cbf43926").json()["verification"]["matches"] is False
+
+
+def test_crc_api_unexpected_crash_is_a_clean_500(monkeypatch):
+    import backend.main as m
+
+    def crash(*a, **k):
+        raise RuntimeError("secret internal detail /srv/crc.py")
+
+    monkeypatch.setattr(m.error_detection_crc, "crc32_compute", crash)
+    r = TestClient(app, raise_server_exceptions=False).post(CRCP, json={"text": "abc"})
+    err = assert_error(r, 500, "internal_error")
+    assert "secret" not in r.text and err["message"] == "Internal server error."
+
+
+def test_crc_api_listed_in_openapi_and_uses_no_forbidden_libraries():
+    assert "post" in client.get("/openapi.json").json()["paths"][CRCP]
+    src = (pathlib.Path(__file__).resolve().parent.parent / "backend" / "main.py").read_text()
+    assert "import zlib" not in src and "import binascii" not in src
+
+
+# ------------------------------------------------------------------ gap-closing tests (found by mutation testing)
+def test_crc_api_corruption_object_formats_both_checksums_as_prefixed_hex():
+    data = b"hello world"
+    c = crc_post(data_hex=data.hex(), flip_bits=[10]).json()["corruption"]
+    corrupted = _crc.flip_bits(data, [10])
+    assert c["original_crc32_hex"] == f"0x{zlib.crc32(data):08x}" == "0x0d4a1185"
+    assert c["corrupted_crc32_hex"] == f"0x{zlib.crc32(corrupted):08x}"
+    assert int(c["original_crc32_hex"], 16) == c["original_crc32"] and int(c["corrupted_crc32_hex"], 16) == c["corrupted_crc32"]
+
+
+def test_crc_api_forged_content_flag_is_false_when_the_flips_cancelled_out():
+    d = crc_post(text="abc", flip_bits=[3, 3], forge_to_match_original=True).json()
+    assert d["corruption"]["net_change"] is False and d["forged"]["content_changed_before_forging"] is False
+    assert d["forged"]["matches_original"] is True and d["forged"]["length_changed_by_bytes"] == 4
+    real = crc_post(text="abc", flip_bits=[3], forge_to_match_original=True).json()
+    assert real["forged"]["content_changed_before_forging"] is True
+    assert "data_differs_from_original" not in real["forged"]                      # the tautological field is gone
+
+
+def test_crc_api_default_trace_sizes():
+    d = crc_post(data_hex=bytes(range(20)).hex()).json()["trace"]
+    assert d["steps_returned"] == len(d["byte_steps"]) == 16 and d["steps_total"] == 20 and d["steps_truncated"] is True
+    assert len(d["bit_steps"]) == 2
+    short = crc_post(text="123456789").json()["trace"]
+    assert len(short["byte_steps"]) == 9 and short["steps_truncated"] is False and len(short["bit_steps"]) == 2

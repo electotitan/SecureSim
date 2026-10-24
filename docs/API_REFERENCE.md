@@ -30,7 +30,7 @@ Tracebacks and the submitted input values are never included in error responses.
 
 ## GET `/api/health`
 
-`{"status": "ok", "app": "...", "version": "0.7.0"}`
+`{"status": "ok", "app": "...", "version": "0.8.0"}`
 
 ## POST `/api/encode/huffman`
 
@@ -257,3 +257,62 @@ Notes:
   counts (`missing`, `missing_count`, `missing_truncated`, ...).
 * `diagnosis` ignores packets that fail their header checksum when computing totals, duplicates and missing sequences (they are listed under `corrupted_*`).
 * `recovered_matches_original` compares the recovered bytes with the input byte for byte; success without a match would be reported as `false`.
+
+
+## POST `/api/error-detect/crc`
+
+Computes CRC-32 with its derivation, optionally verifies it, optionally corrupts the data on purpose, and can forge a CRC-matching message to show that a CRC is
+not authentication. Algorithm and conventions: `MATHEMATICAL_FOUNDATIONS.md` section 10.
+
+| field | type | default | notes |
+|-------|------|---------|-------|
+| `text` / `data_hex` | string | | exactly one required; at most 40,000 bytes |
+| `expected_crc_hex` | 8 hex digits | none | if given, the data is verified against it (`verification`) |
+| `flip_bits` | list of integers | [] | bit positions to flip; at most 1000 entries |
+| `burst_start_bit`, `burst_length` | integers | none | flip every bit from the start for `burst_length` bits (1..4096); give both or neither |
+| `forge_to_match_original` | boolean | false | after the corruption, append 4 computed bytes so the CRC equals the original's; needs `flip_bits` or a burst |
+| `trace_bytes` | integer 0..256 | 16 | bytes of per-byte register steps returned |
+| `bit_trace_bytes` | integer 0..8 | 2 | bytes of bit-level shift/XOR steps returned |
+| `include_table` | boolean | true | return the derived 256-entry table |
+
+**Bit positions** count in transmission order: bit `p` is bit `p mod 8` of byte `p div 8`, bit 0 being the least significant bit of the byte. All listed flips and the
+burst are XOR-ed into the data, so a bit named twice (or by both a flip and the burst) is flipped back; the response reports the **net** change.
+
+Response (abridged; values from a real run):
+
+```json
+{
+  "data_bytes": 9, "crc32": 3421780262, "crc32_hex": "0xcbf43926", "crc32_little_endian_hex": "2639f4cb",
+  "parameters": {"width": 32, "polynomial_normal_hex": "0x04c11db7", "polynomial_reflected_hex": "0xedb88320",
+                 "init_hex": "0xffffffff", "xorout_hex": "0xffffffff", "reflect_input": true, "reflect_output": true,
+                 "check_input": "123456789", "check_value_hex": "0xcbf43926"},
+  "polynomial": {"expression": "x^32 + x^26 + ... + x + 1", "terms": [32, 26, 23, "..."], "degree": 32, "full_hex": "0x104c11db7"},
+  "cross_checks": {"bitwise_matches_table": true, "polynomial_division_matches": true, "all_agree": true},
+  "standard_check_value_ok": true, "residue_check": true,
+  "verification": {"expected_crc32": 3421780262, "expected_crc32_hex": "0xcbf43926", "computed_crc32_hex": "0xcbf43926", "matches": true},
+  "trace": {"initial_register": 4294967295, "byte_steps": [{"index": 0, "byte": 49, "register_before": 4294967295, "table_index": 206,
+            "table_value": 2094854071, "register_after": 2083721288}], "bit_steps": ["..."], "steps_total": 9, "steps_returned": 9,
+            "steps_truncated": false, "final_register": 872412870, "final_xor": 4294967295, "checksum": 3421780262},
+  "table_hex": ["0x00000000", "0x77073096", "..."],
+  "corruption": {"applied": true, "net_change": true, "flipped_bit_count": 1, "flipped_bits": [100], "error_span_bits": 1,
+                 "guaranteed_detection": true, "guarantee_consistent": true, "original_crc32_hex": "0x414fa339",
+                 "corrupted_crc32_hex": "0xaf312e29", "detected": true, "verified_against_original": false, "...": "..."},
+  "forged": {"applied": true, "suffix_hex": "85ef20d7", "forged_crc32_hex": "0x414fa339", "matches_original": true,
+             "detected_by_crc": false, "content_changed_before_forging": true, "length_changed_by_bytes": 4, "note": "..."},
+  "properties": ["A CRC DETECTS errors; it never corrects them. ...", "..."]
+}
+```
+
+Notes:
+* `standard_check_value_ok`, `residue_check` and `cross_checks` are **recomputed on every request**: the check string `123456789` must give `0xCBF43926`, appending the
+  little-endian CRC must give the residue `0x2144DF1C`, and the table, bit-by-bit and polynomial-division computations must agree.
+* `corruption.guaranteed_detection` is true when the **net** error spans at most 32 bits (first to last flipped bit): CRC-32 detects every such burst. When it is false
+  the CRC usually still detects the error but may not. `guarantee_consistent` is a self-check that a guaranteed detection really was detected. If you flip bits so they
+  cancel (`net_change: false`), nothing changed and nothing is detected.
+* `detected: false` is a legitimate outcome, not an error: for error patterns that are multiples of the generator polynomial the corruption escapes (see the worked 33-bit
+  example in the foundations document).
+* `forged` lengthens the data by 4 bytes. `content_changed_before_forging` is false when the requested flips cancelled out.
+* Traces are bounded (`steps_total` / `steps_truncated` give the full size); the checksum always covers all the data. At most 1000 net flipped bit positions are listed
+  (`flipped_bits_truncated`, `flipped_bit_count` is exact).
+* Errors (HTTP 422, `validation_error`): a bit or burst outside the data (`body.flip_bits` / `body.burst_start_bit`, codes `bit_out_of_range` / `burst_out_of_range`), a burst
+  with only one of its two fields, forging without a corruption, and malformed hex or numbers (the offending field is named).

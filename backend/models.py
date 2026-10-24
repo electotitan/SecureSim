@@ -33,6 +33,11 @@ MAX_API_PAYLOAD_SIZE = 4096      # largest payload_size the API accepts (the mod
 MAX_PACKETS_RETURNED = 256       # per-packet records returned per table (statistics cover ALL packets)
 MAX_PAYLOAD_PREVIEW_BYTES = 128  # payload bytes returned per packet record
 MAX_EXPERIMENT_SEQUENCES = 1000  # entries accepted in each drop/duplicate/corrupt list
+MAX_CRC_BYTES = 40_000           # bytes accepted by the CRC endpoint
+MAX_CRC_TRACE_BYTES = 256        # bytes of per-byte register steps returned
+MAX_CRC_BIT_TRACE_BYTES = 8      # bytes of bit-level shift/XOR steps returned
+MAX_BURST_BITS = 4096            # longest burst the experiment can inject
+MAX_FLIPPED_BITS_LISTED = 1000   # net flipped bit positions listed in a response
 MAX_MESSAGE_DIGITS = 160         # decimal string for the integer message
 
 
@@ -545,3 +550,74 @@ class PacketizeResponse(BaseModel):
     diagnosis: dict[str, Any]
     reassembly: dict[str, Any]
     header_checksum_note: str
+
+
+# --------------------------------------------------------------------------- Stage 7: CRC-32
+class CRCRequest(StrictModel):
+    """Compute (and optionally verify) CRC-32, then optionally corrupt the data on purpose.
+
+    Bit positions count in TRANSMISSION order: bit p is bit (p mod 8) of byte (p div 8), bit 0 being the least
+    significant bit of the byte. Positions in ``flip_bits`` and the ``burst`` are XOR-ed into the data, so a bit
+    named twice (or by both) is flipped back and ends up unchanged.
+    """
+    text: Optional[str] = Field(None, max_length=MAX_TEXT_CHARS)
+    data_hex: Optional[str] = Field(None, max_length=2 * MAX_CRC_BYTES)
+    expected_crc_hex: Optional[str] = Field(None, min_length=8, max_length=8,
+                                            description="8 hex digits; if given the data is verified against it")
+    flip_bits: list[SequenceNumber] = Field(default_factory=list, max_length=MAX_EXPERIMENT_SEQUENCES)
+    burst_start_bit: Optional[StrictInt] = Field(None, ge=0)
+    burst_length: Optional[StrictInt] = Field(None, ge=1, le=MAX_BURST_BITS,
+                                              description="Flips every bit from burst_start_bit for burst_length bits")
+    forge_to_match_original: StrictBool = Field(
+        False, description="After the corruption, append 4 computed bytes so the CRC equals the ORIGINAL data's CRC.")
+    trace_bytes: StrictInt = Field(16, ge=0, le=MAX_CRC_TRACE_BYTES)
+    bit_trace_bytes: StrictInt = Field(2, ge=0, le=MAX_CRC_BIT_TRACE_BYTES)
+    include_table: StrictBool = True
+
+    @field_validator("text")
+    @classmethod
+    def _text_is_utf8_encodable(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            try:
+                v.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError("text contains characters that cannot be encoded as UTF-8")
+        return v
+
+    @field_validator("data_hex")
+    @classmethod
+    def _data_hex_valid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_hex(v, "data_hex") if v is not None else v
+
+    @field_validator("expected_crc_hex")
+    @classmethod
+    def _expected_hex_valid(cls, v: Optional[str]) -> Optional[str]:
+        return _check_hex(v, "expected_crc_hex") if v is not None else v
+
+    @model_validator(mode="after")
+    def _consistent_fields(self) -> "CRCRequest":
+        if (self.text is None) == (self.data_hex is None):
+            raise ValueError("provide exactly one of 'text' or 'data_hex'")
+        if (self.burst_start_bit is None) != (self.burst_length is None):
+            raise ValueError("provide both 'burst_start_bit' and 'burst_length', or neither")
+        if self.forge_to_match_original and not (self.flip_bits or self.burst_length is not None):
+            raise ValueError("'forge_to_match_original' needs a corruption ('flip_bits' or a burst) to repair")
+        return self
+
+
+class CRCResponse(BaseModel):
+    data_bytes: int
+    crc32: int
+    crc32_hex: str
+    crc32_little_endian_hex: str = Field(description="The 4 bytes a sender appends")
+    parameters: dict[str, Any]
+    polynomial: dict[str, Any]
+    cross_checks: dict[str, Any]
+    standard_check_value_ok: bool = Field(description="crc32('123456789') == 0xCBF43926, recomputed on every request")
+    residue_check: bool = Field(description="crc32(data + crc32 little-endian) == 0x2144DF1C")
+    verification: Optional[dict[str, Any]]
+    trace: dict[str, Any]
+    table_hex: Optional[list[str]]
+    corruption: Optional[dict[str, Any]]
+    forged: Optional[dict[str, Any]]
+    properties: list[str]
