@@ -150,3 +150,25 @@ Seeded randomness: seeded loss and shuffling use random.Random, which is reprodu
 API caps: payload_size ≤ 4096 and data ≤ 40,000 bytes (the module allows 65,535-byte payloads), 256 table rows and 128 preview bytes per packet. These are my choices.
 
 Next checkpoint: 8 — CRC-32 error detection
+
+Checkpoint: 8 — CRC-32 error detection
+Implemented modules: pipeline/error_detection_crc.py (new), models.py, main.py (POST /api/error-detect/crc),
+                     tests/test_crc.py (70 new), tests/test_api.py (+88 CRC tests), docs §10 and API reference
+Mathematical concepts demonstrated: polynomial division over GF(2), reflected-register arithmetic,
+                     table derivation, burst-error guarantees, linearity and CRC forging
+Unit tests executed: 1160 total (502 API, 151 RSA, 132 packetization, 91 LZ77, 81 AES, 70 CRC, 53 Huffman,
+                     38 GF(2⁸), 33 binary, 8 scaffold, 1 py3.10 guard)
+Tests passed: 1160
+Tests failed: 0
+API verification: POST /api/error-detect/crc checked against a live uvicorn server
+
+Known limitations
+
+Detection only: a CRC detects and never corrects. Hamming and Reed–Solomon, the next error-handling stages, add correction.
+Not authentication: the forging demo shows it. A real system needs a MAC.
+Guarantees bounded: the 2-bit and 3-bit exhaustive tests cover limited message sizes (256-bit and 64-bit). I make no guarantee claim beyond them, and I don’t claim a Hamming distance.
+Escape probability: about 2⁻³² for random damage, which is probabilistic and not a guarantee.
+Caps: at most 40,000 bytes, 1,000 flipped-bit entries and a 4,096-bit burst. These are my choices.
+
+Next checkpoint: 9 — Dijkstra routing
+

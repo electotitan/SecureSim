@@ -31,3 +31,9 @@ curl -s -X POST http://127.0.0.1:8000/api/encrypt/rsa-keyexchange -H 'content-ty
 Result
 Expect reassembly.error_kind: "missing", missing: [1, 3], and the first packet’s header 01000000000000000004000afef1
 
+Check-Point 8
+curl -s -X POST http://127.0.0.1:8000/api/error-detect/crc -H 'content-type: application/json' -d '{"text":"123456789","trace_bytes":3,"bit_trace_bytes":1,"include_table":false}'
+
+Result
+Expect "crc32_hex":"0xcbf43926" and "standard_check_value_ok":true
+
