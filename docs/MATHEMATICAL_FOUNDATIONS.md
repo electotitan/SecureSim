@@ -1,6 +1,6 @@
 # Mathematical Foundations
 
-> Grows stage by stage. Current sections: GF(2^8) and the AES S-box (Checkpoint 2); Huffman coding and binary representation (Checkpoint 3); LZ77 compression (Checkpoint 4); AES-128 (Checkpoint 5); RSA key exchange (Checkpoint 6); packetization (Checkpoint 7).
+> Grows stage by stage. Current sections: GF(2^8) and the AES S-box (Checkpoint 2); Huffman coding and binary representation (Checkpoint 3); LZ77 compression (Checkpoint 4); AES-128 (Checkpoint 5); RSA key exchange (Checkpoint 6); packetization (Checkpoint 7); CRC-32 (Checkpoint 8).
 
 ## 1. The finite field GF(2^8)
 
@@ -499,3 +499,107 @@ lost packets is `p * packet_count`, but an individual run, like the channel BER 
 
 Measured: a 40,000-byte message split into 40,000 one-byte packets with 20 % loss was packetized, perturbed, diagnosed and reassembled in under 0.7 s
 over HTTP (31,850 packets received, 8,150 reported missing).
+
+
+---
+
+## 10. Error detection: CRC-32 (Stage 7)
+
+**Idea.** A CRC treats a message as a polynomial over GF(2) (the two-element field: addition is XOR, there are no carries) and keeps only the
+remainder of a polynomial division. Sender and receiver both compute it; a mismatch means the data changed in transit. Unlike the Internet checksum in
+section 9, a CRC is built on *division*, which makes it sensitive to the **order** of the bits and very good at **burst** errors.
+
+**Generator polynomial.** CRC-32 (IEEE 802.3; used by Ethernet, zlib, PNG, gzip):
+
+    G(x) = x^32 + x^26 + x^23 + x^22 + x^16 + x^12 + x^11 + x^10 + x^8 + x^7 + x^5 + x^4 + x^2 + x + 1
+         = 0x1_04C11DB7        (the "normal" form 0x04C11DB7 drops the implicit x^32 term)
+
+The *reflected* form `0xEDB88320` is its bit reversal (derived in the code, not typed in) and is used because the algorithm shifts the register
+right and consumes each byte least significant bit first, which is the order the bits are transmitted.
+
+**Definition.** `CRC = (M(x) * x^32) mod G(x)`, with the standard conventions *init* `0xFFFFFFFF` (register starts as all ones, so leading zero bytes
+matter), *reflected input and output* and *xorout* `0xFFFFFFFF` (the result is complemented). The standard check: the ASCII string `123456789` has
+CRC-32 `0xCBF43926` (a required test; it passes in the unit tests and over HTTP).
+
+### From polynomial division to a lookup table
+
+One byte is eight bit steps: shift the register right by one, and if the bit that fell out was 1, XOR with `0xEDB88320`. Because the steps are linear,
+what a byte does to the register can be precomputed for all 256 byte values: `table[i]` is the result of loading `i` and doing the eight steps, and then
+one byte costs `reg = table[(reg ^ byte) & 0xFF] ^ (reg >> 8)`. The table is **derived at import** (`generate_table`), never stored. For `i = 1`
+(the code's own steps):
+
+| step | bit shifted out | register |
+|-----:|:---------------:|----------|
+| 0 | - | `0x00000001` |
+| 1 | 1 | `0xedb88320` |
+| 2 | 0 | `0x76dc4190` |
+| 3 | 0 | `0x3b6e20c8` |
+| 4 | 0 | `0x1db71064` |
+| 5 | 0 | `0x0edb8832` |
+| 6 | 0 | `0x076dc419` |
+| 7 | 1 | `0xee0e612c` |
+| 8 | 0 | `0x77073096` |
+
+giving `table[1] = 0x77073096`; likewise `table[2] = 0xee0e612c`, `table[255] = 0x2d02ef8d`. The same generator also produces the CRC-32C
+(Castagnoli) table from `0x82F63B78`, whose check value `0xE3069283` the tests confirm.
+
+**Three independent computations agree** (tests on every length 0 to 70, on thousands of random inputs, and on all 256 single bytes): the table-driven
+version, the bit-by-bit version, and a literal long division of the augmented message in the non-reflected domain, plus Python's `zlib.crc32` used only as
+an outside reference in the tests (the implementation imports no `zlib`, `binascii`, `crcmod` or `hashlib`; checked by an AST test).
+
+### Worked example: `123456789`
+
+Initial register `0xFFFFFFFF`; each row applies the table rule to one byte:
+
+| byte # | input | register before | table index | table entry | register after |
+|-------:|-------|-----------------|-------------|-------------|----------------|
+| 0 | `1` (0x31) | `0xffffffff` | `0xce` | `0x7cdcefb7` | `0x7c231048` |
+| 1 | `2` (0x32) | `0x7c231048` | `0x7a` | `0xb0d09822` | `0xb0acbb32` |
+| 2 | `3` (0x33) | `0xb0acbb32` | `0x01` | `0x77073096` | `0x77b79c2d` |
+| ... | | | | | |
+
+After all nine bytes the register is `0x340bc6d9`; complementing it gives `0xcbf43926`.
+
+### What a CRC-32 detects, and what it cannot
+
+Each claim is either guaranteed by the mathematics or measured by the tests, and the API states which (`guaranteed_detection`).
+
+| error | detected? | evidence |
+|-------|-----------|----------|
+| any single-bit error | always | every bit of messages up to 64 bytes flipped one at a time |
+| any burst of 32 bits or fewer | always | an error polynomial of degree < 32 is never a nonzero multiple of G(x); all lengths 1..32 at every position of a 16-byte message, plus 3,000 random bursts |
+| any two-bit error (tested up to 256-bit messages) | always | all 32,640 pairs in a 32-byte message |
+| any three-bit error (tested up to 64-bit messages) | always | all 41,664 triples in an 8-byte message |
+| a burst longer than 32 bits | almost always, **not guaranteed** | about 1 in 2^32 (2.3e-10) of random patterns escape |
+| an error pattern that is a multiple of G(x) | **never** | constructed below |
+
+No claim is made about odd numbers of errors: G(x) has 15 terms, an odd number, so it is not divisible by (x + 1) and parity-based
+guarantees do not apply.
+
+**A concrete undetected error.** Bit `p` (in transmission order) of an `n`-bit message is the coefficient of `x^(n-1-p)`. The error polynomial
+`G(x) * x^k` is therefore the set of bits `p = n - 1 - (e + k)` for each exponent `e` of G. For the 8-byte message `00 01 02 03 04 05 06 07`
+(`n = 64`, `k = 5`) that flips 15 bits spanning 33 positions: `[26, 32, 35, 36, 42, 46, 47, 48, 50, 51, 53, 54, 56, 57, 58]`. The corrupted message is different, yet its CRC is
+`0x88aa689f`, exactly the original's. The API reports `guaranteed_detection: false`, `detected: false` for this pattern.
+
+**Detection is not correction.** A mismatch says only that something changed. (Hamming and Reed-Solomon, in the next checkpoints, add the redundancy needed
+to locate and repair errors.)
+
+### CRC versus the Internet checksum, and layering
+
+Swapping the 16-bit words of `123456789abcdef0` to `9abc1234def05678` leaves the Internet checksum unchanged (`0x1da6` both times) but changes the CRC
+(`0xa85a34a3` against `0xe77851f4`); replacing `ORIGINAL` by `TAMPERED` in a packet payload leaves the packet *header*
+checksum valid but the CRC differs. That is why the packet header carries a cheap checksum for *framing* and the CRC, computed over the whole packet, protects
+the *content*.
+
+### A CRC is not authentication
+
+CRC is **affine** over GF(2): for equal-length messages `crc(a xor b xor c) = crc(a) xor crc(b) xor crc(c)`. That makes it easy to forge. After four more
+bytes the register depends only on the four table indices used, and the top byte of each table entry is distinct, so the four bytes that force **any**
+chosen CRC can be computed (`crc32_forge_suffix`). Example (verified with `zlib` over HTTP): the message `Transfer 100 EUR to 1234` was altered to
+`Transfer 130 EUR to 1234` and the 4 bytes `7c25016b` appended; the altered message then has the original's CRC `0xa9c88955`.
+Anyone can do this, so a CRC protects against accidents, not against an adversary: use a MAC such as HMAC for that.
+
+Also by linearity, appending a CRC (little-endian) to a message gives the constant residue `0x2144df1c` for every message, a standard receiver check that
+the tests verify.
+
+Measured with the running code: a 40,000-byte message with a 4,096-bit burst, the full 256-entry table and traces was processed over HTTP in 0.13 s.
